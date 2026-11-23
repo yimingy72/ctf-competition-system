@@ -2,23 +2,10 @@
   "format": "GitHub Release assets",
   "releaseTag": "competition-traces-r11-r12",
   "competitionId": "01a1fd2a-91cb-7b42-8146-1be766b4ed8f",
-  "sanitization": {
-    "applied": true,
+  "exportPolicy": {
+    "processingApplied": false,
     "sourceRedactionPolicy": "none",
-    "replacedPatterns": [
-      "Bearer credentials",
-      "Arena solver tokens",
-      "API keys",
-      "Arena PATs",
-      "GitHub tokens"
-    ],
-    "replacementMarkers": [
-      "[REDACTED]",
-      "st_[REDACTED]",
-      "sk-[REDACTED]",
-      "arena_pat_[REDACTED]",
-      "[REDACTED_GITHUB_TOKEN]"
-    ]
+    "description": "Release assets contain the exact downloaded source bytes."
   },
   "traces": [
     {
@@ -30,10 +17,9 @@
       "succeededCount": 19,
       "canceledCount": 1,
       "sourceFile": "attempt-archive-01a1ff8b.ndjson.zst",
-      "sourceBytes": 198599271,
-      "assetFile": "attempt-archive-r11-01a1ff8b.ndjson.zst",
-      "assetBytes": 224270980,
-      "sha256": "dfcf09398dc514dd28837357d5c55046124b783ba04ef2c3e7124e7d5278251c"
+      "assetFile": "attempt-archive-01a1ff8b.ndjson.zst",
+      "assetBytes": 198599271,
+      "sha256": "25ab0f023e3150d6a1125aac70993d2c958aa5511ea0ace93691d2af9b32064c"
     },
     {
       "round": "R12",
@@ -44,10 +30,9 @@
       "succeededCount": 18,
       "canceledCount": 2,
       "sourceFile": "attempt-archive-01a201e3.ndjson.zst",
-      "sourceBytes": 418269410,
-      "assetFile": "attempt-archive-r12-01a201e3.ndjson.zst",
-      "assetBytes": 449142803,
-      "sha256": "0028691df2060d72d1d4fde23436ce81e9d5b661657c3f6dfc954df1c48d6087"
+      "assetFile": "attempt-archive-01a201e3.ndjson.zst",
+      "assetBytes": 418269410,
+      "sha256": "b2655d38324e4a82bcbb71238bfb057897b0ef49da3adf8a7c088ca49bc0158f"
     }
   ]
 }
