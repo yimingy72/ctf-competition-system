@@ -154,6 +154,8 @@ node benchmark/run.mjs --counts 1,8,16,20,32,64 --output .data/benchmark-result
 
 本轮基于 R11/R12 轨迹和固定 R13 代码路径的修复范围、方案二审及真实比赛复测要求见 [运行时优化方案](docs/runtime-optimization-plan.md)。
 
+R12 Token 退化的独立复算、任务归属纠正和第二轮修复见 [Token 退化复审](docs/audits/r12-token-regression.md)，可用 [原始 NDJSON 复算脚本](scripts/recompute-token-cost.py) 重算关键总量。
+
 ## 发布前需补齐的赛事合同
 
 公开手册已经说明 hosted 模式由平台启动 harness，并注入帮助和 attempt token。以下字段仍需赛事平台明确，接入时将它们映射到当前显式配置。

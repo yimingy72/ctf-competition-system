@@ -18,6 +18,19 @@ const challengeParameter = Type.Object({ challenge_id: text });
 const LEAD_ACTIONS = ["create_challenge", "update_challenge", "post_fact", "request_assistance", "reject_review"];
 const WORKER_ACTIONS = ["claim", "post_fact", "post_intent", "claim_intent", "release_intent",
   "request_assistance", "request_deferral", "submit_review"];
+const BOARD_ACTION_ARGUMENTS = {
+  create_challenge: "unique_code,title; optional description,difficulty(easy|medium|hard),multi_stage,priority",
+  update_challenge: "challenge_id,expected_revision; optional title,description,difficulty,multi_stage,priority",
+  claim: "challenge_id,expected_claim_revision",
+  post_fact: "challenge_id,statement,evidence[{type:text,summary}|{artifact_id,summary}]; optional kind(observation|inference|structure),derived_from,disputes:[fact_id],resolves,result,next_intents. Inferences require derived_from. resolves:intent_id and result:confirmed|rejected|inconclusive must appear together; next_intents entries support optional disputes:[intent_id]",
+  post_intent: "challenge_id,statement,based_on:[fact_id],expected,method; optional claim,parallel,parallel_key,depends_on,retry_of,relates_to,disputes:[intent_id]. parallel=true requires parallel_key",
+  claim_intent: "challenge_id,intent_id,expected_version",
+  release_intent: "challenge_id,intent_id,note",
+  request_assistance: "challenge_id,expected_revision,reason; optional additional_workers,intent_ids,blocker_fact_id. Use intent_ids and/or blocker_fact_id. Ready parallel Intents already open capacity; requesting the same direction is an idempotent confirmation",
+  request_deferral: "challenge_id,expected_revision,reason",
+  submit_review: "challenge_id,expected_revision,flag,summary; optional fact_refs",
+  reject_review: "challenge_id,expected_revision,review_revision,reason",
+};
 const MAX_SESSION_ERROR_RETRIES = 3;
 const MAX_IDLE_AVAILABLE_NOTICES = 2;
 const PREPARED_INPUT_VERSION = 1;
@@ -709,7 +722,7 @@ export class ContestRun {
     this.notices = new Map();
     this.retries = new Map();
     this.continuations = new Map();
-    this.stalledReports = new Set();
+    this.stalledReports = new Map();
     this.retryExhausted = new Set();
     this.retryDelayBaseMs = 1000;
     this.retryTimers = new Map();
@@ -773,6 +786,8 @@ export class ContestRun {
     this.assignmentFirstTool.delete(workerId);
     this.assignmentTaskRead.delete(workerId);
     this.assignmentLocalToolSeen.delete(workerId);
+    this.continuations.delete(workerId);
+    this.stalledReports.delete(workerId);
     delete this.metrics.assignment_first_tool[workerId];
     delete this.metrics.task_read_latency_ms[workerId];
   }
@@ -1433,6 +1448,14 @@ export class ContestRun {
     }
     if (event.type === "tool_end") {
       if (event.isError) this.metrics.tool_failures += 1;
+      if (!event.isError && ["bash", "read", "write", "edit"].includes(event.tool)
+        && event.context?.assignment_id
+        && JSON.stringify(assignmentContext(event.context))
+          === JSON.stringify(assignmentContext(this.board.context(id)))) {
+        // A peer's Fact or an empty board_read is not a new local execution segment.
+        this.continuations.delete(id);
+        this.stalledReports.delete(id);
+      }
       this.rememberHardBootstrapTool(id, event);
       const signature = typeof event.args_digest === "string"
         ? JSON.stringify([event.tool, event.context?.assignment_id ?? null,
@@ -1552,8 +1575,7 @@ export class ContestRun {
       if (id !== "lead") {
         const context = this.board.context(id);
         const challenge = context.assignment_id ? this.board.challenge(context.challenge_id) : null;
-        if (!challenge || !["assembling", "solving"].includes(challenge.phase)
-          || challenge.environment?.status !== "active" || !challenge.ready) {
+        if (!challenge || !["assembling", "solving"].includes(challenge.phase) || !challenge.ready) {
           this.schedule();
           return;
         }
@@ -1795,7 +1817,7 @@ export class ContestRun {
           const reviewing = challenge.phase === "reviewing";
           this.queueNotification(member.worker_id, message,
             { eventId: `board:${event.id}:${member.worker_id}`, version: challenge.revision, scope: challengeId,
-              ...(reviewing
+              ...(challenge.phase === "completed" ? { pause: true } : reviewing
                 ? reviewActors.has(member.worker_id) ? { triggerTurn: false } : { pause: true }
                 : {}) });
         }
@@ -1970,20 +1992,20 @@ export class ContestRun {
         if (context.assignment_id && status?.idle
           && ["assembling", "solving"].includes(this.board.challenge(context.challenge_id).phase)) {
           const challenge = this.board.challenge(context.challenge_id);
-          const key = `${id}:${context.challenge_id}:${challenge.revision}`;
-          const continuations = this.continuations.get(key) ?? 0;
+          const previous = this.continuations.get(id);
+          const continuations = previous?.assignment_id === context.assignment_id ? previous.count : 0;
           if (continuations >= 2) {
-            if (!this.stalledReports.has(key)) {
-              this.stalledReports.add(key);
-              this.queueNotification("lead", "Worker 在没有新增黑板版本时连续两轮未形成可核验结果。读取当前题和该 Worker 的 Fact/Intent，决定增加援助、调整方向或暂缓。"
+            if (this.stalledReports.get(id) !== context.assignment_id) {
+              this.stalledReports.set(id, context.assignment_id);
+              this.queueNotification("lead", "Worker 在本段两次自动续跑后仍未收到新的成功本地工具回执。依据该 Worker 已记录的结果和当前方向决定增加援助、调整方向或暂缓；平台继续投递真实新通知。"
                 + JSON.stringify({ worker_id: id, challenge_id: challenge.id, revision: challenge.revision }),
-              { eventId: `stalled:${key}`, scope: challenge.id, version: challenge.revision });
+              { eventId: `stalled:${id}:${context.assignment_id}:${randomUUID()}`, scope: challenge.id, version: challenge.revision });
             }
             continue;
           }
-          this.continuations.set(key, continuations + 1);
+          this.continuations.set(id, { assignment_id: context.assignment_id, count: continuations + 1 });
           await this.notify(id, "本题仍在解题中。结合现有事实、在途结果和意图继续推进，需要时申请援助或向 Lead 提出暂缓建议。",
-            { eventId: `continue:${key}:${continuations + 1}`, scope: context.challenge_id, version: challenge.revision });
+            { eventId: `continue:${id}:${context.assignment_id}:${randomUUID()}`, scope: context.challenge_id, version: challenge.revision });
         }
       }
       await this.flushNotifications();
@@ -2890,6 +2912,7 @@ export class ContestRun {
   }
 
   tools(role, id) {
+    const actions = role === "lead" ? LEAD_ACTIONS : WORKER_ACTIONS;
     const tool = (name, description, parameters, execute) => ({ name, description, parameters,
       execute: async (args, execution) => {
         try { return await execute(args, execution); }
@@ -2925,26 +2948,10 @@ export class ContestRun {
           return role === "lead" ? { ...snapshot, ...this.competitionClock() } : snapshot;
         }),
       tool("board_act", "Update the blackboard. request_id is automatic. Priority is 0 highest through 3 lowest. "
-        + "claim: challenge_id,expected_claim_revision. "
-        + "create_challenge: unique_code,title,description,difficulty(easy|medium|hard),multi_stage,priority. "
-        + "update_challenge: challenge_id,expected_revision plus title,description,difficulty,multi_stage or priority. "
-        + "post_fact: challenge_id,statement,kind(observation|inference|structure),"
-        + "evidence[{type:text,summary}|{artifact_id,summary}],derived_from,disputes:[fact_id]; close held Intent with "
-        + "resolves:intent_id,result:confirmed|rejected|inconclusive; "
-        + "next_intents entries support optional disputes:[intent_id]. "
-        + "post_intent: challenge_id,statement,based_on:[fact_id],expected,method, "
-        + "optional claim/parallel/parallel_key/depends_on/retry_of/disputes:[intent_id]. "
-        + "claim_intent: challenge_id,intent_id,expected_version. "
-        + "release_intent: challenge_id,intent_id,note. "
-        + "request_assistance: challenge_id,expected_revision,reason,additional_workers plus intent_ids and/or "
-        + "blocker_fact_id. Posting a ready parallel Intent already opens assistance capacity, so a following "
-        + "request_assistance for the same direction is an idempotent confirmation. Use blocker_fact_id for a "
-        + "concrete blocker. "
-        + "request_deferral: challenge_id,expected_revision,reason. "
-        + "submit_review: challenge_id,expected_revision,flag,summary; optional fact_refs. "
-        + "reject_review: challenge_id,expected_revision,review_revision,reason. "
-        + "Read the returned revision before another task write.",
-        Type.Object({ action: Type.Union((role === "lead" ? LEAD_ACTIONS : WORKER_ACTIONS).map(action => Type.Literal(action))), args: Type.Record(Type.String(), Type.Unknown()) }),
+        + "Arguments below are required unless marked optional. "
+        + actions.map(action => `${action}: ${BOARD_ACTION_ARGUMENTS[action]}.`).join(" ")
+        + " Read the returned revision before another task write.",
+        Type.Object({ action: Type.Union(actions.map(action => Type.Literal(action))), args: Type.Record(Type.String(), Type.Unknown()) }),
         (args, execution) => {
           if (args.action === "create_challenge" && !this.catalog?.some(item => item.unique_code === args.args.unique_code)) throw new Error("Create tasks using an actual code from arena_list");
           const input = { ...args.args, request_id: execution.callId };

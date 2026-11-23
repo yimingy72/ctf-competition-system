@@ -630,8 +630,8 @@ test("backlog decision re-reads Board after asynchronous resource sampling", asy
   assert.equal(run.board.getMeta("lead_new_task_backlog"), null);
 });
 
-test("an idle Worker receives at most two automatic continuations without a new revision", async (t) => {
-  const { run, pool, create, pump } = await setup(t);
+test("automatic continuations require new local work, not peer revisions or empty board reads", async (t) => {
+  const { run, pool, create, pump, lead } = await setup(t);
   const challenge = create("one");
   await run.startChallenge(challenge.id);
   await pump();
@@ -641,11 +641,38 @@ test("an idle Worker receives at most two automatic continuations without a new 
     await pool.idle(worker);
     await pump();
   }
-  const continuations = pool.notifications.filter(notice => notice.id === worker
+  const continuations = () => pool.notifications.filter(notice => notice.id === worker
     && notice.text.includes("本题仍在解题中"));
-  assert.equal(continuations.length, 2);
+  assert.equal(continuations().length, 2);
   assert.ok(pool.notifications.some(notice => notice.id === "lead"
-    && notice.text.includes("连续两轮未形成可核验结果")));
+    && notice.text.includes("两次自动续跑")));
+
+  const context = run.board.context(worker);
+  lead("post_fact", { challenge_id: challenge.id, statement: "peer fixture discovery",
+    evidence: [{ type: "text", summary: "fresh peer evidence" }] });
+  await pump();
+  assert.ok(pool.notifications.some(notice => notice.id === worker && notice.text.includes("peer fixture discovery")));
+  for (const event of [
+    { tool: "board_read", context },
+    { tool: "record_fact", context },
+    { tool: "bash", context: { ...context, assignment_id: "old-assignment" } },
+    { tool: "bash", context: { ...context, environment_generation: context.environment_generation + 1 } },
+    { tool: "bash", context, isError: true },
+  ]) {
+    run.sessionEvent({ type: "tool_end", agentId: worker, callId: randomUUID(), ...event });
+    await pool.idle(worker);
+    await pump();
+  }
+  assert.equal(continuations().length, 2);
+
+  run.sessionEvent({ type: "tool_end", agentId: worker, tool: "bash", context,
+    callId: "new-local-execution", isError: false });
+  for (let index = 0; index < 3; index++) {
+    await pool.idle(worker);
+    await pump();
+  }
+  assert.equal(continuations().length, 4);
+  assert.equal(new Set(continuations().map(notice => notice.eventId)).size, 4);
 });
 
 test("an idle Worker receives a bounded number of notices for the same available work", async (t) => {
@@ -1680,19 +1707,34 @@ test("unknown close stays recorded until list reconciliation and resuming uses a
   assert.equal(resumed.environment.status, "active");
 });
 
-test("accepted submission releases each worker only after its execution settles", async (t) => {
+test("completed work is paused without another model turn and released only after execution settles", async (t) => {
   const { run, pool, create, pump, submit } = await setup(t);
   const challenge = create("one");
   await run.startChallenge(challenge.id);
   await pump();
   const worker = run.board.challenge(challenge.id).owner_id;
   await pool.begin(worker);
+  let settle;
+  const settling = new Promise(resolve => { settle = resolve; });
+  t.after(() => settle());
+  const abort = pool.abort.bind(pool);
+  let pauseStarted = false;
+  pool.abort = async id => {
+    pauseStarted = true;
+    await settling;
+    return abort(id);
+  };
   await submit(challenge.id, "flag{one}");
-  await pump();
+  await waitFor(() => pauseStarted, "completion pause");
   assert.equal(run.board.challenge(challenge.id).members.length, 1);
-  await pool.idle(worker);
+  settle();
+  await waitFor(() => !run.pumping, "completed execution settled");
   await pump();
   assert.equal(run.board.challenge(challenge.id).members.length, 0);
+  assert.ok(pool.abortCalls.includes(worker));
+  const completeNotice = pool.notifications.find(notice => notice.id === worker
+    && notice.text.includes("本题已通过"));
+  assert.equal(completeNotice.triggerTurn, false);
 });
 
 test("finished workdir restart does not start another remote interaction", async (t) => {
@@ -1812,6 +1854,14 @@ test("worker tool contracts expose dispute inputs and the exact claim revision f
   assert.equal(Object.hasOwn(nextIntent.properties, "disputes"), true);
   assert.equal(Object.hasOwn(recordFact.parameters.properties, "derived_from"), true);
   assert.match(recordFact.description, /separate Board transaction/);
+  const leadAct = run.tools("lead", "lead").find(tool => tool.name === "board_act");
+  assert.doesNotMatch(boardAct.description, /create_challenge:|update_challenge:|reject_review:/);
+  assert.doesNotMatch(leadAct.description, /(?:^|\s)claim:|post_intent:|submit_review:/);
+  for (const definition of [boardAct, leadAct]) {
+    for (const action of definition.parameters.properties.action.anyOf.map(option => option.const)) {
+      assert.ok(definition.description.includes(`${action}: `), action);
+    }
+  }
 });
 
 test("explicit not-started rejection stays distinct from a wrong flag and permits a corrected submission", async (t) => {
@@ -2479,6 +2529,7 @@ test("a partial accepted flag keeps the same team solving until all flags comple
   await pump();
   const members = run.board.challenge(challenge.id).members;
   assert.equal(members.length, 2);
+  await pool.begin(members[0].worker_id);
   const first = await submit(challenge.id, "flag{first}");
   await pump();
   assert.equal(first.outcome, "accepted");
@@ -2488,13 +2539,15 @@ test("a partial accepted flag keeps the same team solving until all flags comple
   assert.deepEqual(partial.members.map((member) => member.id), members.map((member) => member.id));
   assert.ok(partial.members.every((member) => run.board.context(member.worker_id).challenge_id === challenge.id));
   assert.equal(partial.submissions.filter((submission) => submission.status === "accepted").length, 1);
+  assert.equal(pool.abortCalls.includes(partial.owner_id), false);
   assert.equal(arena.stats.finishes, 0);
   await pool.begin(partial.owner_id);
   const second = await submit(challenge.id, "flag{second}");
   await pump();
   assert.equal(second.outcome, "accepted");
   assert.equal(run.board.challenge(challenge.id).phase, "completed");
-  assert.equal(run.board.challenge(challenge.id).members.length, 1);
+  assert.equal(run.board.challenge(challenge.id).members.length, 0);
+  assert.ok(pool.abortCalls.includes(partial.owner_id));
   const releaseNotices = () => pool.notifications.filter(notice => notice.id === "lead"
     && notice.text.includes("online_environment_released"));
   assert.equal(releaseNotices().length, 1);
@@ -2636,6 +2689,37 @@ test("selected materials permit local work before remote start without changing 
   assert.equal(run.board.challenge(challenge.id).generation, 1);
   assert.deepEqual(run.board.context(local.owner_id), context);
   assert.equal(run.board.challenge(challenge.id).environment.status, "active");
+});
+
+test("model retries follow local material readiness before remote activation", async (t) => {
+  const { run, pool, arena, create, pump } = await setup(t, [{
+    unique_code: "online", flag: "flag{online}", container: true,
+    handout: { path: "source.txt", content: "local retry fixture" },
+  }]);
+  const challenge = create("online");
+  await pool.tool("lead", "arena_files", { challenge_id: challenge.id, prepare_paths: ["source.txt"] });
+  await pump();
+  const worker = run.board.challenge(challenge.id).owner_id;
+  run.retryDelayBaseMs = 0;
+  const retries = () => pool.notifications.filter(notice => notice.id === worker
+    && notice.eventId.startsWith("retry:"));
+  for (const state of ["pending", "closed"]) {
+    if (state === "closed") await run.reconcileEnvironments();
+    assert.equal(run.board.challenge(challenge.id).environment.status, state);
+    assert.equal(run.board.challenge(challenge.id).ready, true);
+    const before = retries().length;
+    await pool.begin(worker);
+    await pool.error(worker, "Temporary model failure during local preparation");
+    await waitFor(() => retries().length === before + 1, `local retry with ${state} remote`);
+  }
+  assert.equal(arena.stats.starts, 0);
+  run.board.execute("platform", "set_environment", { challenge_id: challenge.id,
+    status: "closed", ready: false, online: true });
+  const before = retries().length;
+  await pool.begin(worker);
+  await pool.error(worker, "Temporary failure after materials became unavailable");
+  await delay(20);
+  assert.equal(retries().length, before);
 });
 
 test("quota failure and process recovery preserve local work until the first actual activation", async (t) => {

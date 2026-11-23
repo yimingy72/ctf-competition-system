@@ -1,5 +1,7 @@
 # R11/R12 轨迹审计后的运行时优化方案
 
+本文记录第一轮修复。后续针对 R12 Token 退化的复算、任务归属纠正、第二轮代码调整及 258 项回归结果见 [Token 退化复审](audits/r12-token-regression.md)。其中继续保留本文的 Lead 职责和工具入口原则。
+
 ## 证据边界
 
 本轮实现基于 `e64b3db2a7cebdd0ef536cc752235122d472a2eb`。从审计指定的 R13 `4f4a97b2619b3f02fd0a8cb01b456a3f5042fe7a` 到该基线之间，仅 `competition-data/README.md` 和 `competition-data/manifest.json` 发生变化，运行时代码相同。原始数据的 attempt 身份、文件大小和 SHA-256 见 [competition-data](../competition-data/README.md) 及其 manifest；数据位于 [competition-traces-r11-r12 Release](https://github.com/yimingy72/ctf-competition-system/releases/tag/competition-traces-r11-r12)。
