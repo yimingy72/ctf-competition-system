@@ -1,0 +1,53 @@
+{
+  "format": "GitHub Release assets",
+  "releaseTag": "competition-traces-r11-r12",
+  "competitionId": "01a1fd2a-91cb-7b42-8146-1be766b4ed8f",
+  "sanitization": {
+    "applied": true,
+    "sourceRedactionPolicy": "none",
+    "replacedPatterns": [
+      "Bearer credentials",
+      "Arena solver tokens",
+      "API keys",
+      "Arena PATs",
+      "GitHub tokens"
+    ],
+    "replacementMarkers": [
+      "[REDACTED]",
+      "st_[REDACTED]",
+      "sk-[REDACTED]",
+      "arena_pat_[REDACTED]",
+      "[REDACTED_GITHUB_TOKEN]"
+    ]
+  },
+  "traces": [
+    {
+      "round": "R11",
+      "attemptId": "01a1ff8b-5c34-74a6-85b9-0bbd43932344",
+      "startedAt": "2026-11-22T03:18:05.536014+08:00",
+      "finishedAt": "2026-11-22T05:52:03.121297+08:00",
+      "challengeCount": 20,
+      "succeededCount": 19,
+      "canceledCount": 1,
+      "sourceFile": "attempt-archive-01a1ff8b.ndjson.zst",
+      "sourceBytes": 198599271,
+      "assetFile": "attempt-archive-r11-01a1ff8b.ndjson.zst",
+      "assetBytes": 224270980,
+      "sha256": "dfcf09398dc514dd28837357d5c55046124b783ba04ef2c3e7124e7d5278251c"
+    },
+    {
+      "round": "R12",
+      "attemptId": "01a201e3-e2f2-71a2-8a76-9ba54907d475",
+      "startedAt": "2026-11-22T14:14:01.513980+08:00",
+      "finishedAt": "2026-11-22T17:58:39.910868+08:00",
+      "challengeCount": 20,
+      "succeededCount": 18,
+      "canceledCount": 2,
+      "sourceFile": "attempt-archive-01a201e3.ndjson.zst",
+      "sourceBytes": 418269410,
+      "assetFile": "attempt-archive-r12-01a201e3.ndjson.zst",
+      "assetBytes": 449142803,
+      "sha256": "0028691df2060d72d1d4fde23436ce81e9d5b661657c3f6dfc954df1c48d6087"
+    }
+  ]
+}
