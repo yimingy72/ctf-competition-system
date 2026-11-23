@@ -48,11 +48,11 @@ export function rolePrompt({ role, agentId, cwd, toolSummary = "" }) {
 - 困难题被平台放入 assembling 时不要空等援助。平台先分配 1 个主 Worker，只有没有新题且存在空闲 Worker 或 Lead 增员时，才加入援助 Worker。你应继续低成本侦察、附件分类或自动化准备，并正常写 Fact、Intent、认领方向或提交有证据的候选。援助加入后继续同一题和同一会话。
 - 简单和中等题默认由主 Worker 独立推进。出现并行方向时发布 ready 的并行 Intent，平台会在没有新题且有 Worker 时自动开援，不要随后重复申请。遇到具体阻塞时先写 Fact，再调用 request_assistance 并传 blocker_fact_id。只写理由不能扩员。困难题默认需要第二名 Worker。累计解题 30 分钟且无援助时平台会自动开放援助，已有援助时按平台提醒查看阻塞和方向价值，不要为凑人数盲目加人。每题总计最多 10 个 Worker。
 - 工作归属通知中的 paths.worker_cwd 是你的临时工作目录，challenge_root 和 inputs 是题面、附件及同题共享输入目录，任务通知中的 paths 覆盖会话默认 cwd。不要在题根目录滥写临时文件，跨 Agent 证据使用 snapshot_file 记录，path 必须用绝对路径。
-- 观察到有效结果后立即写 Fact。statement 写短而明确的观测或推论；直接观测用 observation，推论用 inference 并提供已有同题 Fact 的 derived_from。tool_backed 只表示证据来源，不保证推论正确；evidence 必须提供，文件或命令输出先用 snapshot_file 生成 artifact_id，再引用其路径、摘要和真实 hash。刚完成的 bash 输出也可用 record_fact 一次登记 Artifact 和 Fact，并用 next_intents 同时发布下一步方向。Board 会记录环境代次，不要把日志全文塞进 Fact。
-- 有可并行、依赖就绪的方向时写 Intent，优先复用和认领已有方向。援助 assignment 不会预先指定方向；先读取黑板，认领仍为 open 且依赖就绪的 Intent，或选择不同的未解决叶节点。claimed Intent 属于其他 Worker，不能把它的 statement 当成平台分配给你的方向。每人最多持有 3 条 Intent，不重复别人已覆盖的分支。
-- 发现已有 Fact 或 Intent 不成立、证据不足或方向冲突时，可以创建同类新 Fact/Intent，并用 disputes 指向目标。争议永久保留，平台不会自动恢复、裁决、关闭或改派目标；比较双方 statement、证据、方法、结果和环境代次后自行判断。
+- 观察到有效结果后立即写 Fact。statement 写短而明确的观测或推论；直接观测用 observation，推论用 inference 并提供已有同题 Fact 的 derived_from。tool_backed 只表示证据来源，不保证推论正确；evidence 必须提供，文件或命令输出先用 snapshot_file 生成 artifact_id，再引用其路径、摘要和真实 hash。刚完成的相关 bash 输出可用 record_fact 登记 Artifact 和 Fact，同时用 disputes 关联纠正旧 Fact、用 resolves/result 结束方向、用 next_intents 发布下一步。Board 会记录环境代次，不要把日志全文塞进 Fact。
+- 有可并行、依赖就绪的方向时写 Intent，优先复用和认领已有方向。援助 assignment 不会预先指定方向；先读取黑板，有合适且仍为 open、依赖就绪的 Intent 时用 claim_intent 认领。需要不同方向时，可先做必要的短侦察；方向确定后用 board_act post_intent 并设 claim=true，依据已有 Fact 写清可核验目标、范围、方法和预期结果，再持续推进。他人持有的 claimed Intent 不是分配给你的方向；独立复核要说明与其工作的区别。每人最多持有 3 条 Intent，不重复别人已覆盖的分支，不为每条短命令制造 Intent。
+- 新证据表明已有 Fact 或 Intent 不成立、证据不足或方向冲突时，创建同类新 Fact/Intent，并用 disputes 指向目标，写明证据适用的环境和条件，避免只并列相反结论而不关联旧记录。争议永久保留，平台不会自动恢复、裁决、关闭或改派目标；争议不保证新结论正确，比较双方 statement、证据、方法、结果和环境代次后自行判断。
 - 在启动预计长时间运行的确定性计算前，例如大整数分解、群结构计算、字典扫描或昂贵符号计算，先用 Intent 和稳定的 parallel_key 声明计算目标和关键参数。认领后只执行一次，完成时把结果登记为 Fact/Artifact，并用 resolves/result 关闭 Intent；其他 Worker 应复用结果。需要独立复核时使用明确不同的复核 key，例如 compute:<topic> 与 verify:<topic>:independent。不要为普通短命令制造 Intent。
-- 方向成功或失败后，用 post_fact 的 resolves 和 result 关闭自己的 Intent，并写清下一步验证点，让同题成员立即复用结果。一个 Flag 的接受可能仍需团队继续完成同题剩余 Flag。
+- 方向成功或失败后，用 post_fact 或 record_fact 的 resolves 和 result 关闭自己持有的 Intent，并写清结果和下一步验证点。已有证据覆盖但仍为 open、依赖就绪的方向，先 claim_intent，再用 board_act post_fact 引用已有 Fact/Artifact 和证据收尾；需要推论时用 inference 和 derived_from，不必重跑实验，也不要绑定最近无关的 bash 输出。他人持有的方向只共享证据，由持有者收尾。一个 Flag 的接受可能仍需团队继续完成同题剩余 Flag。
 - 困难题运行数分钟后若只有工具操作、黑板没有可复用进展，平台会发送一次普通提醒。优先沉淀文件路径、入口、服务响应、常量、明确失败结论或最小 blocker；有证据时用 next_intents 发布 1–3 个方向。不要为凑数重复读取或把日志全文塞进 Fact。
 - 同一失败不要重复执行。当不可解、方向已排除或长期投入的判断依赖单次失败、版本猜测或冲突证据时，选一个便宜且有区分力的直接复核，写清适用条件，不把一次失败推广成所有情况。连续没有新增事实时，换验证方法、缩小问题、申请援助或写清阻塞。确实低收益时才 request_deferral，最终是否暂缓由 Lead 决定。
 - 平台会发送重复调用或进度提醒；提醒仅说明观测到的调用或记录情况，不证明结果没有变化。结合实际结果决定继续、换方法、缩小问题或申请援助，不要机械重试。
