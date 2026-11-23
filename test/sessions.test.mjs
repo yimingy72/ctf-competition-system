@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { appendFile, mkdir, mkdtemp, readFile, rm } from "node:fs/promises";
+import { appendFile, mkdir, mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { createHash } from "node:crypto";
@@ -64,6 +64,32 @@ test("old file-backed tool output is projected to its immutable output path", ()
   assert.equal(compacted[6].content[0].text, "error".repeat(30_000));
 });
 
+test("board history uses its own archive path and preserves recent, error and image results", () => {
+  const messages = Array.from({ length: 6 }, (_, index) => ({
+    role: "toolResult", toolCallId: `board-${index}`, toolName: "board_read",
+    content: [{ type: "text", text: "board".repeat(20_000) }],
+    details: { history_output_path: `/tmp/history/${index}.txt`, history_output_bytes: 100_000,
+      challenge: { facts: ["large snapshot"] } },
+    isError: false, timestamp: index,
+  }));
+  const error = { ...messages[0], toolCallId: "error", isError: true };
+  const image = { ...messages[0], toolCallId: "image", content: [
+    ...messages[0].content, { type: "image", data: "fixture", mimeType: "image/png" },
+  ] };
+  const noArchive = { ...messages[0], toolCallId: "not-archived", details: {} };
+  const short = { ...messages[0], toolCallId: "short", content: [{ type: "text", text: "small receipt" }] };
+  const [unchanged, ...compacted] = compactToolHistory([short, ...messages, error, image, noArchive]);
+  assert.equal(unchanged, short);
+  assert.equal(compacted[0].toolCallId, "board-0");
+  assert.deepEqual(compacted[0].details, {
+    compacted_tool_output: true, history_output_path: "/tmp/history/0.txt", history_output_bytes: 100_000,
+  });
+  assert.match(compacted[0].content[0].text, /Full output remains at \/tmp\/history\/0.txt/);
+  assert.equal(Object.hasOwn(compacted[0].details, "output_path"), false);
+  assert.deepEqual(compacted.slice(2), [...messages.slice(2), error, image, noArchive]);
+  assert.equal(messages[0].content[0].text.length, 100_000);
+});
+
 test("a mismatched Worker context never reaches the model", async (t) => {
   let requests = 0;
   const { pool } = await setup(t, {
@@ -125,6 +151,126 @@ test("persistent Pi sessions are cold until notified and keep history across ass
   assert.equal((await restored.ensure("worker-1")).sessionId, first.sessionId);
   await restored.prompt("worker-1", "after restart");
   assert.match(JSON.stringify(requests.at(-1).context), /second challenge/);
+});
+
+test("SDK archives large board reads, projects older bodies, and restores readable snapshots without replacing evidence", async (t) => {
+  const modelConfig = { ...config, contextWindow: 1_000_000 };
+  const getContext = () => ({ worker_id: "worker-1", assignment_id: "assignment-1", challenge_id: "one", generation: 1 });
+  const values = Array.from({ length: 6 }, (_, index) => ({
+    challenge: { id: "one", revision: index + 1, facts: Array.from({ length: 400 }, (_unused, fact) => ({
+      id: `fact-${fact}`, statement: `snapshot-${index} observation ${fact}: ` + "evidence ".repeat(24),
+    })) },
+    context: getContext(), event_cursor: index + 1,
+  }));
+  let reads = 0;
+  const toolsForRole = () => [{ name: "board_read", description: "fixture blackboard read",
+    parameters: Type.Object({ revision: Type.Integer() }),
+    execute: ({ revision }) => { reads++; return values[revision]; } }];
+  let requests = 0;
+  let projected;
+  let snapshotPath;
+  const callId = index => `board-${index}/../../fixture`;
+  const { pool, root } = await setup(t, { modelConfig, getContext, toolsForRole,
+    streamFunction: (model, context) => {
+      requests++;
+      if (requests === 1) return scripted(model, [{ type: "toolCall", id: "evidence", name: "bash",
+        arguments: { command: "printf 'fixture evidence\\n'" } }], "toolUse");
+      if (requests <= 7) return scripted(model, [{ type: "toolCall", id: callId(requests - 2), name: "board_read",
+        arguments: { revision: requests - 2 } }], "toolUse");
+      if (requests === 8) {
+        projected = structuredClone(context.messages.filter(message => message.toolName === "board_read"));
+        snapshotPath = projected[0].details.history_output_path;
+        return scripted(model, [{ type: "toolCall", id: "read-snapshot", name: "read",
+          arguments: { path: snapshotPath, limit: 8 } }], "toolUse");
+      }
+      assert.match(context.messages.findLast(message => message.toolName === "read").content[0].text,
+        /"id": "one"/);
+      return scripted(model, [{ type: "text", text: "saved snapshot is readable" }]);
+    } });
+  const prepared = await pool.ensure("worker-1");
+  await pool.prompt("worker-1", "inspect board snapshots");
+  assert.equal((await pool.waitIdle("worker-1")).error, null);
+  assert.equal(reads, 6);
+  assert.equal(projected.length, 6);
+  assert.equal(projected[0].details.compacted_tool_output, true);
+  assert.equal(projected[1].details.compacted_tool_output, true);
+  for (let index = 2; index < 6; index++) assert.equal(projected[index].content[0].text, JSON.stringify(values[index]));
+  const inlineBefore = values.reduce((total, value) => total + Buffer.byteLength(JSON.stringify(value)), 0);
+  const inlineAfter = projected.reduce((total, message) => total + Buffer.byteLength(message.content[0].text), 0);
+  assert.ok(inlineBefore - inlineAfter > 150_000, { inlineBefore, inlineAfter });
+  t.diagnostic(`board tool text bytes before=${inlineBefore}, after=${inlineAfter}, removed=${inlineBefore - inlineAfter}`);
+  assert.equal(pool.latestToolOutput("worker-1").call_id, "evidence");
+  assert.equal((await stat(snapshotPath)).mode & 0o777, 0o600);
+  assert.match(snapshotPath, /\/history-output\/[a-f0-9]{64}\.txt$/);
+  const savedText = await readFile(snapshotPath, "utf8");
+  assert.deepEqual(JSON.parse(savedText), values[0]);
+  assert.equal(projected[0].details.history_output_bytes, Buffer.byteLength(savedText));
+  const journal = (await readFile(join(root, "sessions/worker-1/events.jsonl"), "utf8")).trim().split("\n").map(JSON.parse);
+  const original = journal.find(event => event.type === "tool_end" && event.call_id === callId(0)).result;
+  assert.equal(original.content[0].text, JSON.stringify(values[0]));
+  assert.equal(Object.hasOwn(original.details, "output_path"), false);
+  const sessionText = await readFile(prepared.sessionFile, "utf8");
+  assert.ok(sessionText.includes("snapshot-0 observation 399"));
+  // Simulate a completed tool whose journal was written before the SDK persisted its result.
+  const interruptedId = "completed-before-session-write";
+  const record = pool.record("worker-1");
+  record.responseContexts.set(interruptedId, getContext());
+  const interruptedResult = await pool.execute(record, toolsForRole()[0], interruptedId, { revision: 0 });
+  await pool.close();
+  const manager = SessionManager.open(prepared.sessionFile);
+  manager.appendMessage({ role: "assistant", content: [
+    { type: "toolCall", id: interruptedId, name: "board_read", arguments: { revision: 0 } },
+  ], api: config.api, provider: config.provider, model: config.id, usage, stopReason: "toolUse", timestamp: Date.now() });
+
+  let restoredRequests = 0;
+  const restored = await SessionPool.create({ root, modelConfig, getContext, toolsForRole, retry: { enabled: false },
+    streamFunction: (model, context) => {
+      if (++restoredRequests === 1) {
+        const older = context.messages.find(message => message.toolCallId === callId(0));
+        assert.equal(older.details.history_output_path, snapshotPath);
+        assert.equal(older.details.compacted_tool_output, true);
+        const recovered = context.messages.find(message => message.toolCallId === interruptedId);
+        assert.deepEqual(recovered.details, interruptedResult.details);
+        assert.deepEqual(recovered.content, interruptedResult.content);
+        return scripted(model, [{ type: "toolCall", id: "read-restored-snapshot", name: "read",
+          arguments: { path: snapshotPath, offset: 4, limit: 5 } }], "toolUse");
+      }
+      assert.match(context.messages.findLast(message => message.toolName === "read").content[0].text, /"revision": 1/);
+      return scripted(model, [{ type: "text", text: "restored snapshot is readable" }]);
+    } });
+  t.after(() => restored.close());
+  assert.equal((await restored.ensure("worker-1")).sessionId, prepared.sessionId);
+  assert.equal(restored.latestToolOutput("worker-1").call_id, "evidence");
+  await restored.prompt("worker-1", "resume the same challenge");
+  assert.equal((await restored.waitIdle("worker-1")).error, null);
+  assert.equal(reads, 7);
+});
+
+test("board reads stay inline when archiving fails, and small, error or image results are not archived", async (t) => {
+  const { pool } = await setup(t);
+  await pool.ensure("worker-1");
+  const record = pool.record("worker-1");
+  const context = await pool.options.getContext("worker-1");
+  const large = { facts: ["x".repeat(100_000)] };
+  const run = async (callId, value) => {
+    record.responseContexts.set(callId, context);
+    return pool.execute(record, { name: "board_read", execute: () => value }, callId, {});
+  };
+  const small = await run("small-board", { facts: ["small"] });
+  assert.equal(Object.hasOwn(small.details, "history_output_path"), false);
+  const error = { content: [{ type: "text", text: JSON.stringify(large) }], details: {}, isError: true };
+  assert.deepEqual(await run("error-board", error), error);
+  const image = { content: [...error.content, { type: "image", data: "fixture", mimeType: "image/png" }], details: {} };
+  assert.deepEqual(await run("image-board", image), image);
+  await writeFile(join(record.directory, "history-output"), "directory unavailable");
+  const failed = await run("cannot-archive", large);
+  assert.equal(failed.content[0].text, JSON.stringify(large));
+  assert.equal(Object.hasOwn(failed.details, "history_output_path"), false);
+  await rm(join(record.directory, "history-output"));
+  const ordinary = await run("ordinary-board", { facts: ["x".repeat(5000)] });
+  assert.equal(typeof ordinary.details.history_output_path, "string");
+  assert.deepEqual(JSON.parse(await readFile(ordinary.details.history_output_path, "utf8")), { facts: ["x".repeat(5000)] });
+  assert.equal(pool.latestToolOutput("worker-1"), null);
 });
 
 test("Lead retains local preparation tools with a coordination-only system prompt", async (t) => {

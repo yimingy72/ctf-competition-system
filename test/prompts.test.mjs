@@ -56,23 +56,7 @@ test("Lead prompt makes offline preparation and online slot handling explicit", 
   assert.match(prompt, /新未认领任务始终高于援助任务/);
   assert.match(prompt, /request_id 由平台自动生成/);
   assert.match(prompt, /下一次写入前使用最新版本/);
-  for (const action of [
-    "update_challenge: challenge_id,expected_revision",
-    "post_fact: challenge_id,statement,evidence",
-    "request_assistance: challenge_id,expected_revision,reason;[additional_workers,intent_ids,blocker_fact_id]",
-    "reject_review: challenge_id,expected_revision,review_revision,reason",
-    "arena_start: challenge_id",
-    "arena_reconcile: {}",
-    "arena_prepare_offline: {}",
-    "arena_files: challenge_id;[path,prepare_paths] optional",
-    "submit_flag: challenge_id,candidate_id,review_revision",
-    "reconcile_submissions: {}",
-    "defer_challenge: challenge_id,reason,expected_revision;[close_environment] optional",
-    "resume_challenge: challenge_id,expected_revision",
-    "resources: {}",
-    "grow_workers: target_total,reason",
-    "finish_attempt: reason",
-  ]) assert.ok(prompt.includes(action), action);
+  assert.match(prompt, /黑板参数以当前角色的工具定义为准/);
   assert.match(prompt, /TOOL-MANIFEST/);
   assert.match(prompt, /完全不参与解题/);
   assert.match(prompt, /工具供环境准备、附件获取整理与运行故障处理/);
@@ -94,8 +78,6 @@ test("Worker prompt explains permanent disputes and self-directed judgement", ()
   assert.match(prompt, /disputes 指向目标/);
   assert.match(prompt, /争议永久保留/);
   assert.match(prompt, /平台不会自动恢复、裁决、关闭或改派目标/);
-  assert.match(prompt, /post_intent: challenge_id,statement,based_on,expected,method;\[claim,parallel,parallel_key,depends_on,retry_of,relates_to,disputes\]/);
-  assert.match(prompt, /each next Intent may include disputes:\[intent_id\]/);
 });
 
 test("Worker prompt defines selection, evidence, tools and review without subagents", () => {
@@ -137,7 +119,8 @@ test("Worker prompt defines selection, evidence, tools and review without subage
   assert.match(prompt, /推论用 inference 并提供已有同题 Fact 的 derived_from/);
   assert.match(prompt, /tool_backed 只表示证据来源，不保证推论正确/);
   assert.match(prompt, /Lead 只检查已记录证据和官方状态，不替你复现候选/);
-  assert.match(prompt, /修改共享网络、服务、隧道或监听器前/);
+  assert.match(prompt, /修改可能影响同题成员的共享网络、服务、隧道或监听器前/);
+  assert.match(prompt, /普通本地只读探测不需要操作前后各写一条 Fact/);
   assert.match(prompt, /先写 Fact 记录范围、参数、影响和清理方式/);
   assert.match(prompt, /完成后写结果 Fact/);
   assert.match(prompt, /paths\.worker_cwd/);
@@ -147,17 +130,10 @@ test("Worker prompt defines selection, evidence, tools and review without subage
   assert.match(prompt, /board_act claim/);
   assert.match(prompt, /snapshot_file 记录，path 必须用绝对路径/);
   assert.match(prompt, /request_deferral/);
-  for (const action of [
-    "claim: challenge_id,expected_claim_revision",
-    "post_fact: challenge_id,statement,evidence",
-    "post_intent: challenge_id,statement,based_on,expected,method",
-    "claim_intent: challenge_id,intent_id,expected_version",
-    "release_intent: challenge_id,intent_id,note",
-    "request_assistance: challenge_id,expected_revision,reason;[additional_workers,intent_ids,blocker_fact_id]",
-    "request_deferral: challenge_id,expected_revision,reason",
-    "submit_review: challenge_id,expected_revision,flag,summary",
-  ]) assert.ok(prompt.includes(action), action);
-  assert.match(prompt, /parallel=true requires parallel_key/);
+  assert.match(prompt, /黑板参数以当前角色的工具定义为准/);
   assert.match(prompt, /不要创建子 Agent 或 helper/);
+  assert.match(prompt, /不要通过 bash、脚本或 HTTP 直接调用其他模型/);
+  assert.match(prompt, /最短路径/);
+  assert.match(prompt, /增量为空时不要重复查询/);
   assert.match(prompt, /TOOL-MANIFEST/);
 });

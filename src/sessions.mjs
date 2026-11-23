@@ -1,5 +1,5 @@
 import { appendFileSync, existsSync, readFileSync, truncateSync } from "node:fs";
-import { mkdir } from "node:fs/promises";
+import { mkdir, writeFile } from "node:fs/promises";
 import { join, resolve } from "node:path";
 import { createHash, randomUUID } from "node:crypto";
 import { createAssistantMessageEventStream, InMemoryCredentialStore } from "@earendil-works/pi-ai";
@@ -16,6 +16,7 @@ const COMPACTION_CONTEXT_TOKENS = 600_000;
 const COMPACTION_KEEP_RECENT_TOKENS = 20_000;
 const MAX_INLINE_TOOL_OUTPUT_CHARS = 256 * 1024;
 const KEEP_RECENT_TOOL_OUTPUTS = 4;
+const MIN_BOARD_ARCHIVE_CHARS = 4 * 1024;
 const MAX_COMPLETED_CALLS = 200;
 const MAX_CONSUMED_NOTIFICATIONS = 5000;
 
@@ -40,12 +41,17 @@ function textLength(message) {
     total + (item?.type === "text" && typeof item.text === "string" ? item.text.length : 0), 0);
 }
 
+function historyOutputPath(message) {
+  return message.toolName === "board_read"
+    ? message.details?.history_output_path : message.details?.output_path;
+}
+
 export function compactToolHistory(messages) {
   const outputIndexes = [];
   let inlineChars = 0;
   for (const [index, message] of messages.entries()) {
     if (message?.role !== "toolResult" || message.isError
-      || typeof message.details?.output_path !== "string") continue;
+      || typeof historyOutputPath(message) !== "string") continue;
     if (Array.isArray(message.content) && message.content.some((item) => item?.type === "image")) continue;
     outputIndexes.push(index);
     inlineChars += textLength(message);
@@ -56,7 +62,12 @@ export function compactToolHistory(messages) {
   if (!compactedIndexes.size) return messages;
   return messages.map((message, index) => {
     if (!compactedIndexes.has(index)) return message;
-    const details = {
+    const path = historyOutputPath(message);
+    const details = message.toolName === "board_read" ? {
+      compacted_tool_output: true,
+      history_output_path: path,
+      history_output_bytes: message.details.history_output_bytes,
+    } : {
       compacted_tool_output: true,
       output_path: message.details.output_path,
       exit_code: message.details.exit_code ?? null,
@@ -64,19 +75,39 @@ export function compactToolHistory(messages) {
       truncated: message.details.truncated ?? false,
       timed_out: message.details.timed_out ?? false,
     };
+    const text = `Old ${message.toolName} output compacted to keep the session focused. `
+      + `Full output remains at ${path}. `
+      + (message.toolName === "board_read" ? "Read only the saved snapshot lines you need.\n"
+        : "Read it only when needed and record durable conclusions as Fact or Intent.\n")
+      + JSON.stringify(details);
+    if (text.length >= textLength(message)) return message;
     return {
       ...message,
-      content: [{
-        type: "text",
-        text: `Old ${message.toolName} output compacted to keep the session focused. `
-          + `Full output remains at ${message.details.output_path}. `
-          + `Read it only when needed and record durable conclusions as Fact or Intent.\n`
-          + JSON.stringify(details),
-      }],
+      content: [{ type: "text", text }],
       details,
       nestedCalls: undefined,
     };
   });
+}
+
+async function archiveBoardRead(record, callId, result) {
+  // Skip small receipts; the shared 256 Ki-character budget decides when to project snapshots out.
+  if (result.isError || !result.content?.every(item => item?.type === "text" && typeof item.text === "string")
+    || textLength(result) <= MIN_BOARD_ARCHIVE_CHARS) return result;
+  let text = result.content.map(item => item.text).join("\n");
+  // Board responses are JSON. Formatting preserves their values and permits bounded line reads.
+  try { text = JSON.stringify(JSON.parse(text), null, 2) + "\n"; } catch {}
+  try {
+    const directory = join(record.directory, "history-output");
+    await mkdir(directory, { recursive: true, mode: 0o700 });
+    const path = join(directory, `${digest(callId)}.txt`);
+    await writeFile(path, text, { encoding: "utf8", flag: "wx", mode: 0o600 });
+    return { ...result, details: { ...result.details,
+      history_output_path: path, history_output_bytes: Buffer.byteLength(text) } };
+  } catch {
+    // Archiving is optional: preserve the full inline result if the snapshot could not be saved.
+    return result;
+  }
 }
 
 function readJournal(path) {
@@ -127,7 +158,8 @@ function recoverToolResults(manager, calls) {
         + "The outcome is unknown. Inspect the blackboard and saved output before retrying any side effect." }],
     };
     manager.appendMessage({ role: "toolResult", toolCallId: call.id, toolName: call.name,
-      content: result.content, isError: Boolean(result.isError), timestamp: Date.now() });
+      content: result.content, ...(result.details !== undefined ? { details: result.details } : {}),
+      isError: Boolean(result.isError), timestamp: Date.now() });
     if (known?.type !== "tool_end") unresolved.push({ call_id: call.id, tool: call.name, outcome: "unknown" });
   }
   return unresolved;
@@ -401,6 +433,7 @@ export class SessionPool {
           onUpdate?.(update);
           this.emit(record, { type: "tool_progress", callId, tool: tool.name, update });
         } }));
+      if (tool.name === "board_read") result = await archiveBoardRead(record, callId, result);
     } catch (error) {
       const details = {};
       for (const [key, value] of Object.entries(error?.details ?? {})) {
