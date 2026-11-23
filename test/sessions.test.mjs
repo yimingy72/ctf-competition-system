@@ -9,6 +9,7 @@ import { SessionManager } from "@earendil-works/pi-coding-agent";
 import { createAssistantMessageEventStream } from "@earendil-works/pi-ai";
 import { Type } from "typebox";
 import { SessionPool, compactToolHistory, compactionSettings } from "../src/sessions.mjs";
+import { BoardError } from "../src/board.mjs";
 
 const config = { provider: "offline-ctf", id: "scripted", api: "openai-completions", baseUrl: "http://127.0.0.1:1",
   apiKey: "test-only-key", reasoning: false, contextWindow: 100000, maxTokens: 1024 };
@@ -91,7 +92,7 @@ function scripted(model, content, stopReason = "stop", errorMessage) {
 }
 
 async function setup(t, options = {}) {
-  const scratch = fileURLToPath(new URL("../../../.data/ctf-standalone-core-20261121/tests/", import.meta.url));
+  const scratch = fileURLToPath(new URL("../.data/tests/", import.meta.url));
   await mkdir(scratch, { recursive: true });
   const root = await mkdtemp(join(scratch, "session-"));
   const pool = await SessionPool.create({ root, modelConfig: config,
@@ -124,6 +125,94 @@ test("persistent Pi sessions are cold until notified and keep history across ass
   assert.equal((await restored.ensure("worker-1")).sessionId, first.sessionId);
   await restored.prompt("worker-1", "after restart");
   assert.match(JSON.stringify(requests.at(-1).context), /second challenge/);
+});
+
+test("Lead retains local preparation tools with a coordination-only system prompt", async (t) => {
+  let requests = 0;
+  const { pool } = await setup(t, {
+    getContext: () => null,
+    streamFunction: (model, context, _options, meta) => {
+      assert.equal(meta.role, "lead");
+      const systems = context.messages.filter(message => message.role === "system");
+      assert.match(JSON.stringify(systems.map(({ content, sections }) => ({ content, sections }))), /完全不参与解题/);
+      for (const name of ["bash", "read", "write", "edit"]) {
+        assert.ok(systems.flatMap(message => message.toolsAdded ?? []).some(tool => tool.name === name), name);
+      }
+      if (++requests === 1) return scripted(model, [{ type: "toolCall", id: "prepare-manifest", name: "write",
+        arguments: { path: "materials/manifest.txt", content: "fixture materials prepared" } }], "toolUse");
+      assert.equal(context.messages.findLast(message => message.role === "toolResult").isError, false);
+      return scripted(model, [{ type: "text", text: "materials are ready for the Worker" }]);
+    },
+  });
+  await pool.ensure("lead", "lead");
+  await pool.prompt("lead", "prepare the fixture materials");
+  assert.equal((await pool.waitIdle("lead")).error, null);
+  assert.equal(await readFile(join(pool.record("lead").cwd, "materials/manifest.txt"), "utf8"), "fixture materials prepared");
+  assert.equal(requests, 2);
+});
+
+test("tool failures keep compact structured diagnostics in model content and the journal", async (t) => {
+  let requests = 0;
+  const { pool, root } = await setup(t, {
+    toolSecrets: ["fixture-arena-secret"],
+    toolsForRole: () => [{ name: "change", description: "fixture write", parameters: Type.Object({}),
+      execute: () => {
+        const error = new BoardError("revision_conflict", `Refresh ${config.apiKey} fixture-arena-secret`,
+          { revision: 23, claim_revision: 7, note: "fixture-arena-secret", available: [{ large: "omit snapshot" }] });
+        error.outcomeUnknown = true;
+        throw error;
+      } }],
+    streamFunction: (model, context) => {
+      if (++requests === 1) return scripted(model, [{ type: "toolCall", id: "failed-change", name: "change", arguments: {} }], "toolUse");
+      const result = context.messages.findLast(message => message.role === "toolResult");
+      assert.equal(result.isError, true);
+      assert.deepEqual(JSON.parse(result.content[0].text), {
+        code: "revision_conflict", message: "Refresh [redacted] [redacted]",
+        details: { revision: 23, claim_revision: 7, note: "[redacted]" }, outcome_unknown: true,
+      });
+      return scripted(model, [{ type: "text", text: "inspect the saved state before retrying" }]);
+    },
+  });
+  await pool.ensure("worker-1");
+  await pool.prompt("worker-1", "fixture");
+  const journal = await readFile(join(root, "sessions/worker-1/events.jsonl"), "utf8");
+  assert.doesNotMatch(journal, /test-only-key|fixture-arena-secret|omit snapshot/);
+  const completed = journal.trim().split("\n").map(JSON.parse).find(event => event.call_id === "failed-change" && event.type === "tool_end");
+  assert.deepEqual(completed.result.details, JSON.parse(completed.result.content[0].text));
+  assert.equal(completed.result.details.details.revision, 23);
+});
+
+test("latest output does not pin completed calls and remains replayable without pruning unknown outcomes", async (t) => {
+  const { pool } = await setup(t);
+  await pool.ensure("worker-1");
+  const record = pool.record("worker-1");
+  const context = await pool.options.getContext("worker-1");
+  let executions = 0;
+  const observe = { name: "observe", execute: args => { executions++; return { value: args.value }; } };
+  const output = { name: "output", execute: () => {
+    executions++;
+    return { content: [{ type: "text", text: "saved" }], details: { output_path: "/fixture/saved.log" } };
+  } };
+  const run = (id, tool, args = {}) => {
+    record.responseContexts.set(id, context);
+    return pool.execute(record, tool, id, args);
+  };
+  const first = await run("output-0", output);
+  const unknownArgs = { value: "unresolved" };
+  record.calls.set("unknown", { type: "tool_start", tool: observe.name, context,
+    args_digest: createHash("sha256").update(JSON.stringify(unknownArgs)).digest("hex") });
+  for (let i = 1; i <= 500; i++) await run(`call-${i}`, observe, { value: i });
+  assert.equal([...record.calls.values()].filter(event => event.type === "tool_end").length, 200);
+  assert.equal(record.calls.has("output-0"), false);
+  assert.equal(pool.latestToolOutput("worker-1").call_id, "output-0");
+  assert.equal(record.calls.has("unknown"), true);
+  assert.deepEqual(await run("output-0", output), first);
+  assert.deepEqual((await run("call-500", observe, { value: 500 })).details, { value: 500 });
+  await assert.rejects(run("unknown", observe, unknownArgs), /unknown result after interruption/);
+  assert.equal(executions, 501);
+  await run("output-501", output);
+  assert.equal(pool.latestToolOutput("worker-1").call_id, "output-501");
+  assert.equal([...record.calls.values()].filter(event => event.type === "tool_end").length, 200);
 });
 
 test("all tools in one model response keep the pre-claim assignment", async (t) => {

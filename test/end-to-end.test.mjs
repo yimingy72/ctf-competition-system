@@ -241,7 +241,7 @@ function workerDecision(result, commandRuns) {
 
 test("connectivity probe performs one text-only model turn and ends on accepted or rejected receipts", { timeout: 30000 }, async (t) => {
   for (const expectedOutcome of ["accepted", "rejected"]) {
-    const directory = fileURLToPath(new URL("../../../.data/ctf-standalone-tests/", import.meta.url));
+    const directory = fileURLToPath(new URL("../.data/tests/", import.meta.url));
     await mkdir(directory, { recursive: true });
     const workDir = await mkdtemp(join(directory, `connectivity-probe-${expectedOutcome}-`));
     const arenaFlag = expectedOutcome === "accepted" ? "flag{probe}" : "flag{other}";
@@ -291,7 +291,7 @@ test("connectivity probe performs one text-only model turn and ends on accepted 
 });
 
 test("connectivity probe submits on observed output without waiting for stream completion", { timeout: 30000 }, async (t) => {
-  const directory = fileURLToPath(new URL("../../../.data/ctf-standalone-tests/", import.meta.url));
+  const directory = fileURLToPath(new URL("../.data/tests/", import.meta.url));
   await mkdir(directory, { recursive: true });
   const workDir = await mkdtemp(join(directory, "connectivity-probe-length-"));
   const arena = await startFakeArena({
@@ -322,7 +322,7 @@ test("connectivity probe submits on observed output without waiting for stream c
 });
 
 test("connectivity probe rejects a missing flag before calling the model", { timeout: 30000 }, async (t) => {
-  const directory = fileURLToPath(new URL("../../../.data/ctf-standalone-tests/", import.meta.url));
+  const directory = fileURLToPath(new URL("../.data/tests/", import.meta.url));
   await mkdir(directory, { recursive: true });
   const workDir = await mkdtemp(join(directory, "connectivity-probe-no-flag-"));
   const arena = await startFakeArena({
@@ -354,7 +354,7 @@ test("connectivity probe rejects a missing flag before calling the model", { tim
 });
 
 test("connectivity probe aborts a hung model before the attempt deadline and never submits", { timeout: 10000 }, async (t) => {
-  const directory = fileURLToPath(new URL("../../../.data/ctf-standalone-tests/", import.meta.url));
+  const directory = fileURLToPath(new URL("../.data/tests/", import.meta.url));
   await mkdir(directory, { recursive: true });
   const workDir = await mkdtemp(join(directory, "connectivity-probe-timeout-"));
   const arena = await startFakeArena({
@@ -393,7 +393,7 @@ test("connectivity probe aborts a hung model before the attempt deadline and nev
 });
 
 test("connectivity probe submits after the first streamed model output", { timeout: 10000 }, async (t) => {
-  const directory = fileURLToPath(new URL("../../../.data/ctf-standalone-tests/", import.meta.url));
+  const directory = fileURLToPath(new URL("../.data/tests/", import.meta.url));
   await mkdir(directory, { recursive: true });
   const workDir = await mkdtemp(join(directory, "connectivity-probe-streaming-"));
   const arena = await startFakeArena({
@@ -427,7 +427,7 @@ test("connectivity probe submits after the first streamed model output", { timeo
 });
 
 test("real Pi HTTP tools solve two local tasks, recover a rejected flag, reuse a session and explicitly finish", { timeout: 30000 }, async (t) => {
-  const directory = fileURLToPath(new URL("../../../.data/ctf-standalone-tests/", import.meta.url));
+  const directory = fileURLToPath(new URL("../.data/tests/", import.meta.url));
   await mkdir(directory, { recursive: true });
   const workDir = await mkdtemp(join(directory, "end-to-end-"));
   const arena = await startFakeArena({ challenges: [
@@ -478,7 +478,7 @@ test("real Pi HTTP tools solve two local tasks, recover a rejected flag, reuse a
 });
 
 test("default twenty real Pi Workers execute tools and finish twenty local challenges", { timeout: 60000 }, async (t) => {
-  const directory = fileURLToPath(new URL("../../../.data/ctf-standalone-tests/", import.meta.url));
+  const directory = fileURLToPath(new URL("../.data/tests/", import.meta.url));
   await mkdir(directory, { recursive: true });
   const workDir = await mkdtemp(join(directory, "twenty-workers-"));
   const codes = Array.from({ length: 20 }, (_, index) => `parallel-${index + 1}`);
@@ -546,7 +546,7 @@ test("default twenty real Pi Workers execute tools and finish twenty local chall
 });
 
 test("CLI explicit configuration solves a local challenge, exits cleanly and releases its run lock", { timeout: 30000 }, async (t) => {
-  const directory = fileURLToPath(new URL("../../../.data/ctf-standalone-tests/", import.meta.url));
+  const directory = fileURLToPath(new URL("../.data/tests/", import.meta.url));
   await mkdir(directory, { recursive: true });
   const workDir = await mkdtemp(join(directory, "cli-end-to-end-"));
   const arena = await startFakeArena({ challenges: [{ unique_code: "cli", flag: "flag{cli}" }] });

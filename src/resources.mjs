@@ -33,12 +33,12 @@ export class Resources {
   }
 
   async _snapshot() {
-    const files = ["cpu.max", "cpu.stat", "memory.max", "memory.current", "memory.stat", "memory.peak"];
+    const files = ["cpu.max", "cpu.stat", "memory.max", "memory.current", "memory.stat", "memory.peak", "memory.events"];
     const [values, disk] = await Promise.all([
       Promise.all(files.map(name => optionalFile(join(this.cgroupPath, name)))),
       statfs(this.workDir),
     ]);
-    const [cpuMax, cpuStat, memoryMax, memoryCurrent, memoryStat, memoryPeak] = values;
+    const [cpuMax, cpuStat, memoryMax, memoryCurrent, memoryStat, memoryPeak, memoryEvents] = values;
     const now = Date.now();
     const cpu = counters(cpuStat);
     const [quota, period] = (cpuMax ?? "").split(/\s+/);
@@ -48,6 +48,7 @@ export class Resources {
       ? (cpu.usage_usec - this.previous.usage) / (elapsed * 1000) : null;
     this.previous = { time: now, usage: cpu.usage_usec };
     const memory = counters(memoryStat);
+    const events = counters(memoryEvents);
     return {
       sampled_at: new Date(now).toISOString(),
       cpu: {
@@ -64,8 +65,12 @@ export class Resources {
         peak_bytes: memoryPeak === null ? null : Number(memoryPeak),
         anonymous_bytes: memory.anon ?? null,
         file_cache_bytes: memory.file ?? null,
+        oom_count: events.oom ?? null,
+        oom_kill_count: events.oom_kill ?? null,
+        oom_group_kill_count: events.oom_group_kill ?? null,
         node: process.memoryUsage(),
       },
+      runtime: { process_uptime_seconds: process.uptime() },
       disk: { source: this.workDir, available_bytes: disk.bavail * disk.bsize, total_bytes: disk.blocks * disk.bsize },
       event_loop: {
         p99_ms: this.delay.percentile(99) / 1e6,

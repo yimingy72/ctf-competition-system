@@ -165,7 +165,11 @@ export class SessionPool {
   }
 
   redact(text) {
-    return String(text).split(this.options.modelConfig.apiKey).join("[redacted]");
+    let redacted = String(text);
+    for (const secret of [this.options.modelConfig.apiKey, ...(this.options.toolSecrets ?? [])]) {
+      if (typeof secret === "string" && secret) redacted = redacted.split(secret).join("[redacted]");
+    }
+    return redacted;
   }
 
   emit(record, event) {
@@ -185,10 +189,8 @@ export class SessionPool {
     while (record.completedCalls.length - record.completedStart > MAX_COMPLETED_CALLS) {
       const callId = record.completedCalls[record.completedStart];
       const completed = record.calls.get(callId);
-      if (completed?.type === "tool_end" && record.latestOutput?.call_id !== callId) {
-        record.calls.delete(callId);
-      }
-      if (completed?.type === "tool_end" && record.latestOutput?.call_id === callId) break;
+      // latestOutput has its own reference; it must not pin the completed-call window.
+      if (completed?.type === "tool_end") record.calls.delete(callId);
       record.completedStart += 1;
     }
     if (record.completedStart > MAX_COMPLETED_CALLS * 2) {
@@ -371,7 +373,8 @@ export class SessionPool {
   async execute(record, tool, callId, args, signal, onUpdate) {
     const context = record.responseContexts.get(callId);
     if (!record.responseContexts.has(callId)) throw new Error("Tool call has no model request identity");
-    const previous = record.calls.get(callId);
+    const previous = record.calls.get(callId)
+      ?? (record.latestOutput?.call_id === callId ? record.latestOutput : undefined);
     if (previous) {
       if (previous.args_digest !== digest(args) || previous.tool !== tool.name
         || identity(previous.context) !== identity(context)) throw new Error("Tool call identity conflict");
@@ -399,7 +402,19 @@ export class SessionPool {
           this.emit(record, { type: "tool_progress", callId, tool: tool.name, update });
         } }));
     } catch (error) {
-      result = { content: [{ type: "text", text: this.redact(error.message) }], details: {}, isError: true };
+      const details = {};
+      for (const [key, value] of Object.entries(error?.details ?? {})) {
+        if (value === null || ["string", "number", "boolean"].includes(typeof value)) {
+          details[key] = typeof value === "string" ? this.redact(value) : value;
+        }
+      }
+      const failure = {
+        code: this.redact(error?.code ?? "tool_error"),
+        message: this.redact(error?.message ?? error),
+        details,
+        ...(typeof error?.outcomeUnknown === "boolean" ? { outcome_unknown: error.outcomeUnknown } : {}),
+      };
+      result = { ...resultMessage(failure), isError: true };
     } finally {
       record.tools -= 1;
     }

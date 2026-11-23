@@ -345,6 +345,9 @@ export class Board extends EventEmitter {
         id: data.id,
         version: data.version,
         statement: data.statement,
+        kind: data.kind,
+        provenance: data.provenance,
+        environment_generation: data.environment_generation,
         status: data.status,
         author: data.author,
         derived_from: data.derived_from ?? [],
@@ -561,10 +564,10 @@ export class Board extends EventEmitter {
     return challenge;
   }
   _revision(challenge, args, allowEarlier = false) {
-    requireValue(Number.isSafeInteger(args.expected_revision)
-      && (allowEarlier ? args.expected_revision <= challenge.revision : args.expected_revision === challenge.revision)
-      && args.expected_revision >= 1, "revision_conflict", "Refresh the challenge before retrying",
-    { revision: challenge.revision });
+    requireValue(Number.isSafeInteger(args.expected_revision) && args.expected_revision >= 1,
+      "invalid_argument", "expected_revision must be a positive integer", { revision: challenge.revision });
+    requireValue(allowEarlier ? args.expected_revision <= challenge.revision : args.expected_revision === challenge.revision,
+      "revision_conflict", "Refresh the challenge before retrying", { revision: challenge.revision });
   }
   _claimRevision(challenge, args) {
     const expected = args.expected_claim_revision ?? args.expected_revision;
@@ -803,7 +806,7 @@ export class Board extends EventEmitter {
       ...(args.connection !== undefined ? { connection: args.connection } : {}),
       ...(args.online !== undefined ? { online: args.online } : {}) };
     if (args.ready !== undefined) challenge.ready = Boolean(args.ready);
-    if (args.status === "closed") challenge.ready = false;
+    if (args.status === "closed" && args.ready !== true) challenge.ready = false;
     this._touch(challenge, "environment.updated", ["lead"], {}, { claim: true });
     return this.challenge(challenge.id);
   }

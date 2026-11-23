@@ -5,7 +5,7 @@ import { join, resolve } from "node:path";
 import test from "node:test";
 import { loadConfig, parseArenaHelp } from "../src/config.mjs";
 
-const root = fileURLToPath(new URL("../../../.data/ctf-standalone-tests/", import.meta.url));
+const root = fileURLToPath(new URL("../.data/tests/", import.meta.url));
 const help = "# Scenario\n- Attempt: attempt-fixture\nAttempt window: this attempt expires at 2026-11-22T03:00:00Z; closes afterwards.\nARENA_SOLVER_BASE_URL=http://127.0.0.1:12345\nBENCHMARK_BASE_URL=http://127.0.0.1:12345 # alias\n";
 const model = {
   provider: "fixture", id: "fixture-model", api: "openai-completions",

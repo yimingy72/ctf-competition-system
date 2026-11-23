@@ -6,7 +6,7 @@ import { join } from "node:path";
 import { acquireRunLock } from "../src/run-lock.mjs";
 
 test("only one main process owns a work directory and the lock can be reacquired", async () => {
-  const directory = fileURLToPath(new URL("../../../.data/ctf-standalone-tests/", import.meta.url));
+  const directory = fileURLToPath(new URL("../.data/tests/", import.meta.url));
   await mkdir(directory, { recursive: true });
   const work = await mkdtemp(join(directory, "lock-"));
   try {
@@ -19,7 +19,7 @@ test("only one main process owns a work directory and the lock can be reacquired
 });
 
 test("unexpected helper exit reports lock loss and blocks the old owner from continuing", async () => {
-  const directory = fileURLToPath(new URL("../../../.data/ctf-standalone-tests/", import.meta.url));
+  const directory = fileURLToPath(new URL("../.data/tests/", import.meta.url));
   await mkdir(directory, { recursive: true });
   const work = await mkdtemp(join(directory, "lock-lost-"));
   try {
