@@ -1,0 +1,9 @@
+node_modules/
+.data/
+*.log
+*.tar
+*.tar.gz
+*.tgz
+__pycache__/
+*.pyc
+.DS_Store

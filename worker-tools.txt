@@ -1,0 +1,7 @@
+容器已预装常用 CTF 工具。按题型直接使用，不要批量执行 --version；完整命令、路径和版本见 /opt/ctf-tools/manifest.json，仅在不清楚工具路由时读取。
+基础/WEB：file、binutils、gcc/g++、rg、7z、curl/wget、nc/socat、nmap、sqlmap、ffuf、gobuster、dirsearch。普通用户扫描使用 nmap -sT。
+PWN/逆向：gdb、pwndbg/GEF、pwntools、ROPgadget、checksec、angr、radare2、Ghidra（/usr/share/ghidra/support/analyzeHeadless）、JADX、gcc/g++、javap。
+密码/模拟：Sage（/usr/local/bin/sage，解释器 /opt/sage/bin/python）、Z3、PyCryptodome、gmpy2、sympy、fpylll、Qiling（/usr/local/bin/qiling-python）、Lua 5.1（/usr/bin/lua5.1）。普通 Python 工具统一使用 /usr/bin/python3，科学计算使用 /usr/local/bin/sage-python。
+综合渗透：/usr/local/bin/chisel、proxychains4、sshpass、rlwrap、Impacket、NetExec 使用 nxc、smbclient/rpcclient、ldapsearch、MariaDB/Redis/PyMongo。proxychains 只代理 TCP。sudo 有 CAP_NET_RAW，没有 CAP_NET_ADMIN。隧道、反向 shell 或会改变共享环境的命令必须在同一 bash 调用内有界完成，并用同题 Fact 记录入口、参数、结果和清理状态。
+文件/取证/杂项：tshark/Scapy、Volatility3、ExifTool、OpenCV/PIL、ImageMagick、binwalk、foremost、steghide、zsteg、ffmpeg/sox、zbarimg/qrencode、bkcrack、John（字典 /usr/share/john/password.lst）、Poppler/qpdf。
+关键运行时：Python /usr/bin/python3，Node /usr/local/bin/node，Sage /usr/local/bin/sage。

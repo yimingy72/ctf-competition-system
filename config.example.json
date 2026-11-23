@@ -1,0 +1,17 @@
+{
+  "workDir": "/workspace/ctf-run",
+  "model": {
+    "provider": "contest-provider",
+    "id": "replace-with-hosted-model-id",
+    "api": "openai-completions",
+    "baseUrl": "http://replace-with-hosted-model-endpoint/v1",
+    "apiKeyEnv": "CTF_MODEL_API_KEY",
+    "contextWindow": 1000000,
+    "maxTokens": 393216,
+    "reasoning": true,
+    "thinkingLevel": "max",
+    "thinkingLevelMap": {
+      "max": "max"
+    }
+  }
+}
