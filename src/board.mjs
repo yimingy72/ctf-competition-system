@@ -384,6 +384,7 @@ export class Board extends EventEmitter {
         parallel: data.parallel === true,
         parallel_key: data.parallel_key ?? null,
         result: data.result ?? null,
+        ...((data.result_facts ?? []).length ? { result_facts: data.result_facts } : {}),
       };
     }
     if (entity === "candidate") {
@@ -1058,11 +1059,15 @@ export class Board extends EventEmitter {
     }
     const assistanceChanged = this._autoAssistance(challenge);
     this._touch(challenge, "fact.posted", [], { fact_id: fact.id }, { claim: assistanceChanged });
+    if (fact.resolves) this._event("intent.closed", challenge, [], { intent_id: fact.resolves });
     for (const intent of nextIntents) {
       this._event("intent.posted", challenge, [], { intent_id: intent.id });
     }
     return { fact, intents: nextIntents, revision: challenge.revision,
-      claim_revision: challenge.claim_revision };
+      claim_revision: challenge.claim_revision,
+      ...(fact.resolves ? {
+        resolved_intent: this._withDisputeRelations("intent", this._get("intent", fact.resolves)),
+      } : {}) };
   }
   _postIntent(actor, args, context) {
     const challenge = this._authority(actor, args, context,

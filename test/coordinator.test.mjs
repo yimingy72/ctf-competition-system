@@ -1682,6 +1682,124 @@ test("record_fact snapshots the latest bash output and publishes a compact recei
   }, { context }), /current task assignment/);
 });
 
+test("record_fact corrects a Fact and delivers a closed Intent with its result to teammates", async (t) => {
+  const { run, pool, create, pump } = await setup(t, undefined, { initialWorkers: 2 });
+  const challenge = create("one", { difficulty: "hard" });
+  await run.startChallenge(challenge.id);
+  await pump();
+  const current = run.board.challenge(challenge.id);
+  const worker = current.owner_id;
+  const teammate = current.members.find(member => member.worker_id !== worker).worker_id;
+  const context = run.board.context(worker);
+  const oldFact = run.board.execute(worker, "post_fact", {
+    request_id: randomUUID(), challenge_id: challenge.id,
+    statement: "The fixture appears to require a header",
+    evidence: [{ type: "text", summary: "Initial fixture observation" }],
+  }, context).fact;
+  const direction = run.board.execute(worker, "post_intent", {
+    request_id: randomUUID(), challenge_id: challenge.id,
+    statement: "Check whether the fixture requires a header",
+    based_on: [oldFact.id], expected: "A response that distinguishes the two cases",
+    method: "Compare the fixture with and without the header", claim: true,
+  }, context).intent;
+  const output = join(run.config.workDir, "comparison-output.log");
+  await writeFile(output, "Both fixture inputs are accepted\n");
+  pool.latestOutputs.set(worker, { call_id: "comparison-bash", tool: "bash", context,
+    details: { output_path: output } });
+  await pump();
+  pool.notifications.length = 0;
+
+  const receipt = await pool.tool(worker, "record_fact", {
+    challenge_id: challenge.id,
+    statement: "The fixture accepts input without the header",
+    disputes: [oldFact.id], resolves: direction.id, result: "confirmed",
+    next_intents: [{
+      statement: "Check the next independent input field",
+      expected: "The next field has a reproducible response",
+      method: "Change only the next field", claim: true,
+    }],
+  }, { context });
+  assert.deepEqual(receipt.fact.disputes, [oldFact.id]);
+  assert.equal(receipt.fact.resolves, direction.id);
+  assert.match(receipt.fact.evidence[0].sha256, /^[0-9a-f]{64}$/);
+  assert.equal(receipt.resolved_intent.status, "closed");
+  assert.equal(receipt.resolved_intent.result, "confirmed");
+  assert.deepEqual(receipt.resolved_intent.result_facts, [receipt.fact.id]);
+  assert.equal(receipt.intents[0].holder, worker);
+  const corrected = run.board.challenge(challenge.id).facts.find(fact => fact.id === oldFact.id);
+  assert.deepEqual(corrected.disputed_by, [receipt.fact.id]);
+  assert.equal(corrected.status, "disputed");
+  await pump();
+
+  const notices = pool.notifications.filter(notice => notice.id === teammate
+    && notice.eventId.startsWith("board:"));
+  assert.equal(notices.length, 1);
+  const payload = notificationPayload(notices[0]);
+  const closure = payload.changes.find(change => change.entity === "intent" && change.id === direction.id);
+  assert.equal(closure.event_type, "intent.closed");
+  assert.equal(closure.data.status, "closed");
+  assert.equal(closure.data.version, receipt.resolved_intent.version);
+  assert.equal(closure.data.result, "confirmed");
+  assert.deepEqual(closure.data.result_facts, [receipt.fact.id]);
+  const correction = payload.changes.find(change => change.entity === "fact" && change.id === receipt.fact.id);
+  assert.equal(correction.data.disputed_refs[0].id, oldFact.id);
+  assert.equal(payload.changes.some(change => change.id === receipt.intents[0].id), true);
+  assert.equal(pool.notifications.some(notice => notice.id === "lead"), false);
+});
+
+test("record_fact preserves relationship validation and rolls back failed Fact transactions", async (t) => {
+  const { run, pool, create, pump } = await setup(t, undefined, { initialWorkers: 2 });
+  const challenge = create("one", { difficulty: "hard" });
+  await run.startChallenge(challenge.id);
+  await pump();
+  const current = run.board.challenge(challenge.id);
+  const worker = current.owner_id;
+  const teammate = current.members.find(member => member.worker_id !== worker).worker_id;
+  const context = run.board.context(worker);
+  const basis = run.board.execute(worker, "post_fact", {
+    request_id: randomUUID(), challenge_id: challenge.id, statement: "Initial observation",
+    evidence: [{ type: "text", summary: "Synthetic fixture" }],
+  }, context).fact;
+  const direction = actor => run.board.execute(actor, "post_intent", {
+    request_id: randomUUID(), challenge_id: challenge.id, statement: `Check ${actor}'s field`,
+    based_on: [basis.id], expected: "A reproducible response", method: "Inspect one field", claim: true,
+  }, run.board.context(actor)).intent;
+  const own = direction(worker);
+  const other = direction(teammate);
+  const foreign = create("foreign");
+  const foreignFact = run.board.execute("lead", "post_fact", {
+    request_id: randomUUID(), challenge_id: foreign.id, statement: "A separate task's observation",
+    evidence: [{ type: "text", summary: "Unrelated fixture" }],
+  }).fact;
+  const output = join(run.config.workDir, "relationship-output.log");
+  await writeFile(output, "Relevant fixture output\n");
+  pool.latestOutputs.set(worker, { call_id: "relationship-bash", tool: "bash", context,
+    details: { output_path: output } });
+  const before = run.board.challenge(challenge.id);
+  const relationEvents = () => run.board.events().filter(event => /^(fact|intent)\./.test(event.type));
+  const beforeEvents = relationEvents();
+  const cases = [
+    [{ resolves: own.id }, "invalid_fact"],
+    [{ result: "confirmed" }, "invalid_fact"],
+    [{ resolves: own.id, result: "unknown" }, "invalid_argument"],
+    [{ disputes: [foreignFact.id] }, "invalid_reference"],
+    [{ resolves: other.id, result: "confirmed" }, "intent_not_held"],
+    [{ disputes: [basis.id], resolves: own.id, result: "confirmed",
+      next_intents: [{ statement: "Missing expected result and method" }] }, "invalid_argument"],
+  ];
+  for (const [relationships, code] of cases) {
+    await assert.rejects(pool.tool(worker, "record_fact", {
+      challenge_id: challenge.id, statement: "Rejected relationship update", ...relationships,
+    }, { context }), error => error.code === code);
+    const after = run.board.challenge(challenge.id);
+    assert.deepEqual(after.facts, before.facts);
+    assert.deepEqual(after.intents, before.intents);
+    assert.deepEqual(relationEvents(), beforeEvents);
+  }
+  // Artifact registration is an earlier, separate transaction; only Fact changes roll back.
+  assert.ok(run.board.challenge(challenge.id).artifacts.length > before.artifacts.length);
+});
+
 test("unknown close stays recorded until list reconciliation and resuming uses a new environment generation", async (t) => {
   const { run, arena, pool, create, pump } = await setup(t, [{ unique_code: "one", flag: "flag{one}", container: true }]);
   const challenge = create("one");
@@ -1853,6 +1971,10 @@ test("worker tool contracts expose dispute inputs and the exact claim revision f
   const nextIntent = recordFact.parameters.properties.next_intents.items;
   assert.equal(Object.hasOwn(nextIntent.properties, "disputes"), true);
   assert.equal(Object.hasOwn(recordFact.parameters.properties, "derived_from"), true);
+  assert.equal(Object.hasOwn(recordFact.parameters.properties, "disputes"), true);
+  assert.equal(Object.hasOwn(recordFact.parameters.properties, "resolves"), true);
+  assert.deepEqual(recordFact.parameters.properties.result.anyOf.map(option => option.const),
+    ["confirmed", "rejected", "inconclusive"]);
   assert.match(recordFact.description, /separate Board transaction/);
   const leadAct = run.tools("lead", "lead").find(tool => tool.name === "board_act");
   assert.doesNotMatch(boardAct.description, /create_challenge:|update_challenge:|reject_review:/);

@@ -716,6 +716,76 @@ test("Intent facts, ownership, three holdings and parallel direction dependencie
   assert.equal(board.challenge(challenge.id).intents.find((item) => item.id === held.id).attempts, 1);
 });
 
+test("an open direction can reuse a teammate result after claiming and emits one replay-safe closure", (t) => {
+  const { board, create, call } = setup(t, 2);
+  const challenge = create({ difficulty: "hard" });
+  board.execute("platform", "dispatch");
+  const basis = fact(call, "worker-1", challenge.id);
+  const direction = intent(call, "worker-1", challenge.id, basis.id);
+  const observed = call("worker-1", "post_fact", {
+    challenge_id: challenge.id,
+    statement: "The fixture accepts the documented input",
+    evidence: [{ type: "text", summary: "An existing observed result" }],
+  });
+  assert.equal(Object.hasOwn(observed, "resolved_intent"), false);
+  const context = board.context("worker-2");
+  const args = {
+    request_id: "close-existing-direction",
+    challenge_id: challenge.id,
+    statement: "The existing observation satisfies the direction's expected result",
+    kind: "inference",
+    derived_from: [observed.fact.id],
+    evidence: [{ type: "text", summary: "Reuse the existing observation without repeating the experiment" }],
+    resolves: direction.id,
+    result: "confirmed",
+    next_intents: [{
+      statement: "Check a distinct remaining input",
+      expected: "A result for the remaining input",
+      method: "Read the remaining fixture",
+    }],
+  };
+  const beforeClaim = board.getMeta("event_cursor");
+  fails(() => board.execute("worker-2", "post_fact", args, context), "intent_not_held");
+  assert.equal(board.getMeta("event_cursor"), beforeClaim);
+  assert.equal(board._get("intent", direction.id).status, "open");
+  call("worker-2", "claim_intent", {
+    challenge_id: challenge.id,
+    intent_id: direction.id,
+    expected_version: direction.version,
+  });
+  const cursor = board.getMeta("event_cursor");
+  const receipt = board.execute("worker-2", "post_fact", args, context);
+  assert.equal(receipt.resolved_intent.id, direction.id);
+  assert.equal(receipt.resolved_intent.status, "closed");
+  assert.equal(receipt.resolved_intent.result, "confirmed");
+  assert.equal(receipt.resolved_intent.closed_by, "worker-2");
+  assert.equal(receipt.resolved_intent.version, direction.version + 2);
+  assert.deepEqual(receipt.resolved_intent.result_facts, [receipt.fact.id]);
+  assert.deepEqual(receipt.fact.derived_from, [observed.fact.id]);
+
+  const events = board.events(cursor);
+  assert.deepEqual(events.map(event => event.type), ["fact.posted", "intent.closed", "intent.posted"]);
+  assert.ok(events.every(event => event.revision === receipt.revision));
+  assert.equal(events[1].intent_id, direction.id);
+  assert.equal(Object.hasOwn(events[1], "fact_id"), false);
+  const updates = board.snapshot("worker-1", {
+    view: "updates", challengeId: challenge.id, sinceRevision: cursor,
+  });
+  const closed = updates.changes.find(change => change.event_type === "intent.closed");
+  assert.equal(closed.entity, "intent");
+  assert.equal(closed.id, direction.id);
+  assert.equal(closed.data.status, "closed");
+  assert.equal(closed.data.result, "confirmed");
+  assert.deepEqual(closed.data.result_facts, [receipt.fact.id]);
+  assert.deepEqual(board._eventChange(events[1]).data.result_facts, [receipt.fact.id]);
+
+  const after = board.challenge(challenge.id);
+  const afterCursor = board.getMeta("event_cursor");
+  assert.deepEqual(board.execute("worker-2", "post_fact", args, context), receipt);
+  assert.deepEqual(board.challenge(challenge.id), after);
+  assert.equal(board.getMeta("event_cursor"), afterCursor);
+});
+
 test("references are scoped and immutable file evidence keeps the registered version", (t) => {
   const { board, create, call } = setup(t, 2);
   const a = create(); const b = create(); board.execute("platform", "dispatch");
@@ -838,11 +908,12 @@ test("replaying a dispute request does not duplicate versions or relations", (t)
   assert.equal(board.getMeta("event_cursor"), intentCursor);
 });
 
-test("a failed next Intent rolls back the Fact and every dispute mutation", (t) => {
+test("a failed next Intent rolls back the Fact, closure and every dispute mutation", (t) => {
   const { board, create, call } = setup(t, 2);
   const challenge = create({ difficulty: "hard" });
   board.execute("platform", "dispatch");
   const target = fact(call, "worker-1", challenge.id);
+  const held = intent(call, "worker-2", challenge.id, target.id, { claim: true });
   const before = board.challenge(challenge.id);
   const cursor = board.getMeta("event_cursor");
   assert.throws(() => board.execute("worker-2", "post_fact", {
@@ -852,6 +923,8 @@ test("a failed next Intent rolls back the Fact and every dispute mutation", (t) 
     statement: "This whole transaction must roll back",
     evidence: [{ type: "text", summary: "Rollback fixture" }],
     disputes: [target.id],
+    resolves: held.id,
+    result: "confirmed",
     next_intents: [
       {
         statement: "Valid first direction",
@@ -870,6 +943,7 @@ test("a failed next Intent rolls back the Fact and every dispute mutation", (t) 
   assert.equal(after.facts.length, before.facts.length);
   assert.equal(after.intents.length, before.intents.length);
   assert.equal(after.facts.find(item => item.id === target.id).version, target.version);
+  assert.deepEqual(after.intents.find(item => item.id === held.id), before.intents.find(item => item.id === held.id));
   assert.equal(board.getMeta("event_cursor"), cursor);
 });
 

@@ -110,7 +110,7 @@ test("Worker prompt defines selection, evidence, tools and review without subage
   assert.match(prompt, /文件路径、入口、服务响应、常量、明确失败结论或最小 blocker/);
   assert.match(prompt, /next_intents 发布 1–3 个方向/);
   assert.match(prompt, /援助 assignment 不会预先指定方向/);
-  assert.match(prompt, /claimed Intent 属于其他 Worker/);
+  assert.match(prompt, /他人持有的 claimed Intent/);
   assert.match(prompt, /先用 Intent 和稳定的 parallel_key 声明计算目标和关键参数/);
   assert.match(prompt, /compute:<topic> 与 verify:<topic>:independent/);
   assert.match(prompt, /每个 bash 调用结束时会清理该调用的进程组/);

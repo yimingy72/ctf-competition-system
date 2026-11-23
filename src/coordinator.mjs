@@ -402,6 +402,7 @@ function factSummary(fact) {
     status: fact.status,
     author: fact.author,
     environment_generation: fact.environment_generation,
+    ...(fact.resolves ? { resolves: fact.resolves, result: fact.result } : {}),
     ...(disputes.length ? {
       disputes: disputes.slice(0, MAX_COMPACT_DISPUTE_REFS),
       disputes_count: disputes.length,
@@ -436,6 +437,10 @@ function intentSummary(intent) {
     environment_generation: intent.environment_generation,
     based_on: intent.based_on ?? [],
     depends_on: intent.depends_on ?? [],
+    ...(intent.status === "closed" ? {
+      result: intent.result ?? null,
+      result_facts: intent.result_facts ?? [],
+    } : {}),
     ...(disputes.length ? {
       disputes: disputes.slice(0, MAX_COMPACT_DISPUTE_REFS),
       disputes_count: disputes.length,
@@ -505,8 +510,10 @@ function assignmentTaskState(challenge, event, role, eventCursor = event.id, { f
     needs_task_read: needsTaskRead,
     assignment_role: role,
     assignment_reason: role === "assistant"
-      ? "Assistance assignment; no direction is preassigned. Read task state, reuse an open ready direction, "
-        + "or investigate a different unresolved leaf"
+      ? "Assistance assignment; no direction is preassigned. Read task state. When investigating, reuse your "
+        + "current held Intent, claim an open ready Intent, or after brief reconnaissance use post_intent "
+        + "with claim:true for a distinct goal, method and expected result. Other workers' claimed Intents "
+        + "are not assigned to you"
       : "Primary assignment; read task state before solving",
     assistance: {
       target: challenge.assistance_target ?? 0,
@@ -2981,7 +2988,7 @@ export class ContestRun {
           assertOrigin();
           return this.board.execute("platform", "register_artifact", { ...artifact, challenge_id: args.challenge_id, worker_id: id, context: execution.context });
         }),
-      tool("record_fact", "Record a short Fact from the latest completed bash output. The platform registers an immutable Artifact first, then creates the Fact and optional next_intents in a separate Board transaction. Inferences require derived_from Fact ids. Each next Intent may carry disputes:[intent_id].",
+      tool("record_fact", "Record a short Fact from the latest completed bash output. The platform registers an immutable Artifact first, then commits the Fact, disputes, resolves/result and optional next_intents in a separate Board transaction. Inferences require derived_from Fact ids. disputes contains Fact ids; paired resolves/result closes only your held Intent. Each next Intent may carry disputes:[intent_id].",
         Type.Object({
           challenge_id: text,
           statement: text,
@@ -2989,6 +2996,10 @@ export class ContestRun {
             .map(value => Type.Literal(value)))),
           summary: Type.Optional(text),
           derived_from: Type.Optional(Type.Array(text)),
+          disputes: Type.Optional(Type.Array(text)),
+          resolves: Type.Optional(text),
+          result: Type.Optional(Type.Union(["confirmed", "rejected", "inconclusive"]
+            .map(value => Type.Literal(value)))),
           next_intents: Type.Optional(Type.Array(Type.Object({
             statement: text,
             expected: text,
@@ -3028,6 +3039,9 @@ export class ContestRun {
             statement: args.statement,
             kind: args.kind,
             derived_from: args.derived_from,
+            disputes: args.disputes,
+            resolves: args.resolves,
+            result: args.result,
             evidence: [{ artifact_id: registered.id,
               summary: args.summary ?? `Captured output from ${latest.tool}` }],
             next_intents: args.next_intents,
