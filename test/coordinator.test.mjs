@@ -11,7 +11,7 @@ import { Resources } from "../src/resources.mjs";
 import { ScriptedPool } from "./helpers/scripted-pool.mjs";
 import { startFakeArena } from "./helpers/fake-arena.mjs";
 
-const root = fileURLToPath(new URL("../../../.data/ctf-standalone-tests/", import.meta.url));
+const root = fileURLToPath(new URL("../.data/tests/", import.meta.url));
 
 async function setup(t, challenges = [{ unique_code: "one", flag: "flag{one}" }],
   { beforeStart, mode = "attempt", initialWorkers = 20 } = {}) {
@@ -1626,6 +1626,8 @@ test("record_fact snapshots the latest bash output and publishes a compact recei
   const receipt = await pool.tool(worker, "record_fact", {
     challenge_id: challenge.id,
     statement: "The fixture output is stable",
+    kind: "inference",
+    derived_from: [basis.id],
     summary: "Latest bash output",
     next_intents: [{
       statement: "Use the stable output",
@@ -1635,6 +1637,8 @@ test("record_fact snapshots the latest bash output and publishes a compact recei
     }],
   }, { context });
   assert.equal(receipt.fact.statement, "The fixture output is stable");
+  assert.equal(receipt.fact.kind, "inference");
+  assert.deepEqual(receipt.fact.derived_from, [basis.id]);
   assert.equal(receipt.intents.length, 1);
   const disputedTarget = run.board.challenge(challenge.id).intents.find(item => item.id === target.id);
   assert.equal(disputedTarget.disputed, true);
@@ -1799,10 +1803,15 @@ test("worker tool contracts expose dispute inputs and the exact claim revision f
   assert.match(boardAct.description, /next_intents entries support optional disputes:\[intent_id\]/);
   assert.match(boardAct.description, /intent_ids and\/or blocker_fact_id/);
   assert.match(boardAct.description, /idempotent confirmation/);
+  assert.match(boardAct.description, /submit_review: challenge_id,expected_revision,flag,summary/);
+  assert.match(boardAct.description, /claim_intent: challenge_id,intent_id,expected_version/);
+  assert.match(boardAct.description, /release_intent: challenge_id,intent_id,note/);
   const recordFact = tools.find(tool => tool.name === "record_fact");
   assert.match(recordFact.description, /next Intent may carry disputes:\[intent_id\]/);
   const nextIntent = recordFact.parameters.properties.next_intents.items;
   assert.equal(Object.hasOwn(nextIntent.properties, "disputes"), true);
+  assert.equal(Object.hasOwn(recordFact.parameters.properties, "derived_from"), true);
+  assert.match(recordFact.description, /separate Board transaction/);
 });
 
 test("explicit not-started rejection stays distinct from a wrong flag and permits a corrected submission", async (t) => {
@@ -2547,6 +2556,15 @@ test("reconciliation notices an active environment that stopped outside the coor
   await run.startChallenge(challenge.id);
   await pump();
   assert.equal(run.board.challenge(challenge.id).environment.status, "active");
+  // Simulate a stop after the Board's active receipt but before its marker write.
+  run.board.setMeta(`environment_activated:${challenge.id}:1`, false);
+  const listChallenges = run.arena.listChallenges.bind(run.arena);
+  run.arena.listChallenges = async (...args) => (await listChallenges(...args))
+    .map(item => ({ ...item, container_status: "unrecognized" }));
+  await run.reconcileEnvironments();
+  assert.equal(run.board.challenge(challenge.id).environment.status, "unknown");
+  assert.equal(run.board.getMeta(`environment_activated:${challenge.id}:1`), true);
+  run.arena.listChallenges = listChallenges;
   await run.arena.close("one");
   await run.reconcileEnvironments();
   await run.flushNotifications();
@@ -2555,6 +2573,7 @@ test("reconciliation notices an active environment that stopped outside the coor
   assert.equal(reconciled.ready, false);
   assert.equal(reconciled.phase, "deferred");
   assert.equal(reconciled.members.length, 0);
+  assert.equal(run.board.getMeta(`environment_activated:${challenge.id}:1`), true);
   assert.equal(arena.stats.starts, 1);
   assert.equal(run.board.getMeta(`external_environment_closed:${challenge.id}:${reconciled.generation}`).status,
     "handled");
@@ -2564,4 +2583,232 @@ test("reconciliation notices an active environment that stopped outside the coor
   await run.reconcileEnvironments();
   await run.flushNotifications();
   assert.equal(notices().length, 1);
+  await pool.tool("lead", "resume_challenge", {
+    challenge_id: challenge.id, expected_revision: run.board.challenge(challenge.id).revision,
+  });
+  assert.equal(run.board.challenge(challenge.id).generation, 2);
+});
+
+test("selected materials permit local work before remote start without changing download-only behavior", async (t) => {
+  const { run, pool, arena, create, pump } = await setup(t, [{
+    unique_code: "online", flag: "flag{online}", container: true,
+    handout: { path: "handouts/source.txt", content: "Local source fixture" },
+  }]);
+  const challenge = create("online");
+  await pool.tool("lead", "arena_files", { challenge_id: challenge.id, path: "handouts/source.txt" });
+  await pump();
+  assert.equal(run.board.challenge(challenge.id).ready, false);
+  assert.equal(run.board.challenge(challenge.id).members.length, 0);
+  const prepared = await pool.tool("lead", "arena_files", {
+    challenge_id: challenge.id, prepare_paths: ["handouts/source.txt"],
+  });
+  await pump();
+  const local = run.board.challenge(challenge.id);
+  assert.equal(arena.stats.starts, 0);
+  assert.equal(local.ready, true);
+  assert.equal(local.environment.status, "pending");
+  assert.equal(local.members.length, 1);
+  assert.equal(prepared.materials.scope, "selected");
+  const filesBefore = arena.calls.filter(call => call.operation === "files").length;
+  const factsBefore = local.facts.length;
+  const cached = await pool.tool("lead", "arena_files", {
+    challenge_id: challenge.id, prepare_paths: ["handouts/source.txt"],
+  });
+  assert.equal(cached.cached, true);
+  assert.equal(arena.calls.filter(call => call.operation === "files").length, filesBefore);
+  assert.equal(run.board.challenge(challenge.id).facts.length, factsBefore);
+  for (const args of [
+    { path: "handouts/source.txt", prepare_paths: ["handouts/source.txt"] },
+    { prepare_paths: [] },
+    { prepare_paths: ["handouts/source.txt", "handouts/source.txt"] },
+    { prepare_paths: ["unlisted.txt"] },
+  ]) {
+    await assert.rejects(pool.tool("lead", "arena_files", { challenge_id: challenge.id, ...args }),
+      error => ["invalid_argument", "material_not_listed"].includes(error.code));
+  }
+  assert.equal(run.board.challenge(challenge.id).ready, true);
+  const context = run.board.context(local.owner_id);
+  await run.reconcileEnvironments();
+  assert.equal(run.board.challenge(challenge.id).environment.status, "closed");
+  assert.deepEqual(run.board.context(local.owner_id), context);
+  assert.equal(run.board.challenge(challenge.id).ready, true);
+  await run.startChallenge(challenge.id);
+  assert.equal(run.board.challenge(challenge.id).generation, 1);
+  assert.deepEqual(run.board.context(local.owner_id), context);
+  assert.equal(run.board.challenge(challenge.id).environment.status, "active");
+});
+
+test("quota failure and process recovery preserve local work until the first actual activation", async (t) => {
+  const definitions = ["a", "b", "c", "d"].map(unique_code => ({
+    unique_code, flag: `flag{${unique_code}}`, container: true,
+    handout: { path: "source.txt", content: `${unique_code} source fixture` },
+  }));
+  const { run, pool, arena, config, create, pump } = await setup(t, definitions);
+  const challenges = definitions.map(item => create(item.unique_code));
+  const target = challenges[3];
+  for (const challenge of challenges.slice(0, 3)) await run.startChallenge(challenge.id);
+  await assert.rejects(run.startChallenge(target.id), error => error.code === "environment_limit");
+  assert.equal(run.board.challenge(target.id).ready, false);
+  await pool.tool("lead", "arena_files", { challenge_id: target.id, prepare_paths: ["source.txt"] });
+  await pump();
+  const worker = run.board.challenge(target.id).owner_id;
+  const context = run.board.context(worker);
+  await assert.rejects(run.startChallenge(target.id), error => error.code === "environment_limit");
+  await run.reconcileEnvironments();
+  assert.equal(run.board.challenge(target.id).ready, true);
+  assert.equal(run.board.challenge(target.id).phase, "solving");
+  assert.deepEqual(run.board.context(worker), context);
+  await run.stop("synthetic_process_restart");
+  const recovered = await ContestRun.create(config, { poolFactory: async options => new ScriptedPool(options) });
+  t.after(() => recovered.stop("test_complete"));
+  await recovered.start();
+  assert.equal(recovered.board.challenge(target.id).ready, true);
+  assert.deepEqual(recovered.board.context(worker), context);
+  const first = recovered.board.challenge(challenges[0].id);
+  await recovered.defer({ challenge_id: first.id, expected_revision: first.revision,
+    reason: "Release one synthetic remote slot" }, randomUUID());
+  await recovered.startChallenge(target.id);
+  assert.equal(recovered.board.challenge(target.id).generation, 1);
+  assert.equal(recovered.board.challenge(target.id).environment.status, "active");
+  assert.deepEqual(recovered.board.context(worker), context);
+  const recorded = recovered.board.execute(worker, "post_fact", {
+    request_id: randomUUID(), challenge_id: target.id, statement: "Local work survived first activation",
+    evidence: [{ type: "text", summary: "Synthetic generation continuity" }],
+  }, context);
+  assert.equal(recorded.fact.environment_generation, 1);
+  assert.equal(arena.stats.activeMax, 3);
+});
+
+test("selected preparation never caches itself as a complete offline file listing", async (t) => {
+  const { run, pool, create } = await setup(t, [{ unique_code: "offline", container: false, flag: "flag{offline}" }]);
+  const challenge = create("offline");
+  const downloads = [];
+  run.arena.listFiles = async () => [{ path: "source.txt" }, { path: "runtime.txt" }];
+  run.arena.readFile = async (_code, path) => {
+    downloads.push(path);
+    return new Response(`${path} fixture`);
+  };
+  await pool.tool("lead", "arena_files", { challenge_id: challenge.id, prepare_paths: ["source.txt"] });
+  assert.deepEqual(downloads, ["source.txt"]);
+  await pool.tool("lead", "arena_files", { challenge_id: challenge.id, path: "runtime.txt" });
+  assert.equal(run.board.challenge(challenge.id).ready, true);
+  assert.equal((await run.validatePreparedInputs(run.board.challenge(challenge.id))).valid, true);
+  const full = await run.prepareOffline();
+  assert.equal(full.failed, 0);
+  assert.equal(full.tasks[0].materials.scope, "listed");
+  assert.equal(full.tasks[0].files.length, 2);
+  assert.ok(downloads.includes("runtime.txt"));
+});
+
+for (const stage of ["listing", "download"]) test(`preparation rejects a generation change during ${stage}`, async (t) => {
+  const { run, pool, create, pump } = await setup(t, [{
+    unique_code: "online", container: true, flag: "flag{online}",
+    handout: { path: "source.txt", content: "fixture" },
+  }]);
+  const challenge = create("online");
+  await pump();
+  run.started = false;
+  run.board.execute("platform", "set_environment", { challenge_id: challenge.id, status: "active", ready: true });
+  let reachedGate;
+  const reached = new Promise(resolve => { reachedGate = resolve; });
+  let releaseGate;
+  const gate = new Promise(resolve => { releaseGate = resolve; });
+  const pause = async () => { reachedGate(); await gate; };
+  const listFiles = run.arena.listFiles.bind(run.arena);
+  run.arena.listFiles = async (...args) => { if (stage === "listing") await pause(); return listFiles(...args); };
+  run.arena.readFile = async () => {
+    if (stage === "download") await pause();
+    return new Response("old generation fixture");
+  };
+  const preparation = pool.tool("lead", "arena_files", {
+    challenge_id: challenge.id, prepare_paths: ["source.txt"],
+  });
+  const rejected = assert.rejects(preparation, error => error.code === "stale_context");
+  await reached;
+  run.board.execute("platform", "set_environment", {
+    challenge_id: challenge.id, status: "pending", ready: false, new_generation: true,
+  });
+  releaseGate();
+  await rejected;
+  assert.equal(run.board.challenge(challenge.id).generation, 2);
+  assert.equal(run.board.challenge(challenge.id).ready, false);
+  assert.equal(run.board.getMeta(`offline_prepared:${challenge.id}:2`), null);
+});
+
+test("a confirmed remote restart still advances generation and rejects former local contexts", async (t) => {
+  const { run, pool, create, pump } = await setup(t, [{
+    unique_code: "online", container: true, flag: "flag{online}",
+    handout: { path: "source.txt", content: "fixture" },
+  }]);
+  const challenge = create("online");
+  await pool.tool("lead", "arena_files", { challenge_id: challenge.id, prepare_paths: ["source.txt"] });
+  await pump();
+  const worker = run.board.challenge(challenge.id).owner_id;
+  const context = run.board.context(worker);
+  await run.startChallenge(challenge.id);
+  const current = run.board.challenge(challenge.id);
+  await run.defer({ challenge_id: challenge.id, expected_revision: current.revision,
+    reason: "Restart the synthetic remote environment" }, randomUUID());
+  const deferred = run.board.challenge(challenge.id);
+  await pool.tool("lead", "resume_challenge", { challenge_id: challenge.id, expected_revision: deferred.revision });
+  await pump();
+  assert.equal(run.board.challenge(challenge.id).generation, 2);
+  assert.throws(() => run.board.execute(worker, "post_fact", {
+    request_id: randomUUID(), challenge_id: challenge.id, statement: "Old generation result",
+    evidence: [{ type: "text", summary: "Old context must be refused" }],
+  }, context), error => error.code === "stale_context");
+});
+
+test("candidate contract errors are separate from claim conflicts and Lead sees live deadline context", async (t) => {
+  const { run, pool, create, pump, review } = await setup(t);
+  const challenge = create("one");
+  await run.startChallenge(challenge.id);
+  await pump();
+  const worker = run.board.challenge(challenge.id).owner_id;
+  await assert.rejects(pool.tool(worker, "board_act", {
+    action: "submit_review", args: { challenge_id: challenge.id, flag: "flag{one}", summary: "Fixture" },
+  }), error => error.code === "invalid_argument");
+  await assert.rejects(pool.tool(worker, "board_act", {
+    action: "submit_review", args: { challenge_id: challenge.id, expected_revision: 1,
+      flag: "flag{one}", summary: "Fixture" },
+  }), error => error.code === "revision_conflict");
+  assert.equal(run.metrics.claim_conflicts, 0);
+  assert.equal(run.metrics.tool_errors["board_act.submit_review:invalid_argument"], 1);
+  assert.equal(run.metrics.tool_errors["board_act.submit_review:revision_conflict"], 1);
+  run.config.arena.expiresAt = Date.now() + 90000;
+  await review(challenge.id, "flag{one}");
+  await pump();
+  const batch = pool.notifications.findLast(notice => notice.id === "lead" && notice.eventId.startsWith("lead-batch:"));
+  const clock = notificationPayload(batch).clock;
+  assert.ok(clock.remaining_seconds >= 88 && clock.remaining_seconds <= 90);
+  assert.equal(clock.expires_at, new Date(run.config.arena.expiresAt).toISOString());
+  const snapshot = await pool.tool("lead", "board_read", { view: "task", challenge_id: challenge.id });
+  assert.ok(snapshot.remaining_seconds >= 88 && snapshot.remaining_seconds <= 90);
+  assert.equal(snapshot.expires_at, clock.expires_at);
+});
+
+test("repeat detection separates tools and assignments and does not infer that results are unchanged", async (t) => {
+  const { run, create, pump } = await setup(t);
+  const challenge = create("one");
+  await run.startChallenge(challenge.id);
+  await pump();
+  const worker = run.board.challenge(challenge.id).owner_id;
+  const context = run.board.context(worker);
+  const emit = (tool, assignment = context.assignment_id) => run.sessionEvent({
+    type: "tool_end", agentId: worker, tool, args_digest: "same-args", isError: false,
+    context: { ...context, assignment_id: assignment },
+  });
+  const cursor = run.board.getMeta("event_cursor");
+  emit("bash");
+  emit("bash");
+  emit("board_read");
+  emit("bash", "prior-assignment");
+  emit("bash");
+  assert.equal(run.board.events(cursor).filter(event => event.type === "progress.stalled").length, 0);
+  emit("bash");
+  emit("bash");
+  const notices = run.board.events(cursor).filter(event => event.type === "progress.stalled");
+  assert.equal(notices.length, 1);
+  assert.match(notices[0].reason, /inspect its results/);
+  assert.doesNotMatch(notices[0].reason, /without a new result/);
 });

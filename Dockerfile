@@ -88,7 +88,7 @@ manifest_path.with_suffix(".sha256").write_text(
     f"{hashlib.sha256(manifest_path.read_bytes()).hexdigest()}  {manifest_path.name}\n"
 )
 PY
-RUN mkdir -p /workspace/ctf-run /.data && chown 10000:10000 /workspace/ctf-run /.data
+RUN mkdir -p /workspace/ctf-run /opt/ctf-runner/.data && chown 10000:10000 /workspace/ctf-run /opt/ctf-runner/.data
 ENV HOME=/workspace \
     NODE_ENV=production
 WORKDIR /workspace/ctf-run

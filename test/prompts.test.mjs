@@ -38,9 +38,10 @@ test("Lead prompt makes offline preparation and online slot handling explicit", 
   assert.match(prompt, /API 返回 409、environment_limit 或其他配额拒绝时保留原始错误/);
   assert.match(prompt, /只有决定是否增员或怀疑 CPU、内存、磁盘、事件循环存在压力时才读取 resources/);
   assert.match(prompt, /初始团队是 20 个同级 Worker/);
-  assert.match(prompt, /你拥有 grow_workers 权限和主动增员的义务/);
+  assert.match(prompt, /你拥有 grow_workers 权限/);
+  assert.doesNotMatch(prompt, /主动增员的义务|应优先调用 grow_workers 扩员/);
   assert.match(prompt, /待援助但无空闲 Worker/);
-  assert.match(prompt, /资源仍有安全余量且存在有效并行工作时，应优先调用 grow_workers 扩员/);
+  assert.match(prompt, /未领取的 ready Intent、具体 blocker 或新题是否确有可执行方向/);
   assert.match(prompt, /有新任务积压且没有可分配 Worker/);
   assert.match(prompt, /先使用通知内附带的紧凑 resources/);
   assert.match(prompt, /只有怀疑采样过期或执行状态已变化时才重新读取 resources/);
@@ -63,7 +64,7 @@ test("Lead prompt makes offline preparation and online slot handling explicit", 
     "arena_start: challenge_id",
     "arena_reconcile: {}",
     "arena_prepare_offline: {}",
-    "arena_files: challenge_id;[path] optional",
+    "arena_files: challenge_id;[path,prepare_paths] optional",
     "submit_flag: challenge_id,candidate_id,review_revision",
     "reconcile_submissions: {}",
     "defer_challenge: challenge_id,reason,expected_revision;[close_environment] optional",
@@ -73,6 +74,14 @@ test("Lead prompt makes offline preparation and online slot handling explicit", 
     "finish_attempt: reason",
   ]) assert.ok(prompt.includes(action), action);
   assert.match(prompt, /TOOL-MANIFEST/);
+  assert.match(prompt, /完全不参与解题/);
+  assert.match(prompt, /工具供环境准备、附件获取整理与运行故障处理/);
+  assert.match(prompt, /不亲自分析漏洞或题目算法/);
+  assert.match(prompt, /也不亲自复现候选/);
+  assert.match(prompt, /明确要求 Worker 补充，不自行补做实验/);
+  assert.match(prompt, /prepare_paths 成功后可先开放本地工作/);
+  assert.match(prompt, /不能把本地 ready 当成远端服务可用/);
+  assert.match(prompt, /remaining_seconds/);
 });
 
 test("Worker prompt explains permanent disputes and self-directed judgement", () => {
@@ -122,8 +131,12 @@ test("Worker prompt defines selection, evidence, tools and review without subage
   assert.match(prompt, /claimed Intent 属于其他 Worker/);
   assert.match(prompt, /先用 Intent 和稳定的 parallel_key 声明计算目标和关键参数/);
   assert.match(prompt, /compute:<topic> 与 verify:<topic>:independent/);
-  assert.match(prompt, /每个 bash 调用结束时会终止该调用启动的整个进程组/);
-  assert.match(prompt, /bash 启动的后台进程会随该次调用结束而终止/);
+  assert.match(prompt, /每个 bash 调用结束时会清理该调用的进程组/);
+  assert.match(prompt, /不能依赖 bash 后台进程跨调用存活/);
+  assert.match(prompt, /cleanup_unknown/);
+  assert.match(prompt, /推论用 inference 并提供已有同题 Fact 的 derived_from/);
+  assert.match(prompt, /tool_backed 只表示证据来源，不保证推论正确/);
+  assert.match(prompt, /Lead 只检查已记录证据和官方状态，不替你复现候选/);
   assert.match(prompt, /修改共享网络、服务、隧道或监听器前/);
   assert.match(prompt, /先写 Fact 记录范围、参数、影响和清理方式/);
   assert.match(prompt, /完成后写结果 Fact/);

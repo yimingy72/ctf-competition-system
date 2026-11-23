@@ -509,6 +509,9 @@ test("board views return incremental entity bodies and exact entity reads", (t) 
   assert.equal(Object.hasOwn(challengeChange.data, "facts"), false);
   assert.equal(Object.hasOwn(challengeChange.data, "intents"), false);
   const compactFact = board._eventChange(board.events().find((event) => event.fact_id === saved.id));
+  assert.equal(compactFact.data.kind, "observation");
+  assert.equal(compactFact.data.provenance, "self_reported");
+  assert.equal(compactFact.data.environment_generation, saved.environment_generation);
   assert.equal(Object.hasOwn(compactFact.data, "evidence"), false);
   assert.equal(Object.hasOwn(compactFact.data, "notes"), false);
   assert.equal(Object.hasOwn(compactFact.data, "disputes"), false);
@@ -527,6 +530,32 @@ test("board views return incremental entity bodies and exact entity reads", (t) 
   });
   assert.equal(entity.data.id, saved.id);
   assert.equal(entity.data.evidence[0].summary, "Read fixture description");
+});
+
+test("compact Fact events retain inference provenance without promoting it to truth", (t) => {
+  const { board, create, call } = setup(t, 1);
+  const challenge = create();
+  board.execute("platform", "set_environment", {
+    challenge_id: challenge.id, status: "active", ready: true, new_generation: true,
+  });
+  board.execute("platform", "dispatch");
+  const basis = fact(call, "worker-1", challenge.id);
+  const artifact = board.execute("platform", "register_artifact", {
+    challenge_id: challenge.id, worker_id: "worker-1", context: board.context("worker-1"),
+    path: "/workspace/fixture-output", uri: "artifacts/fixture-output", sha256: "a".repeat(64),
+    size: 4, call_id: "fixture-tool-call",
+  });
+  const inferred = fact(call, "worker-1", challenge.id, {
+    kind: "inference", derived_from: [basis.id],
+    evidence: [{ artifact_id: artifact.id, summary: "The output supports this hypothesis" }],
+  });
+  const change = board._eventChange(board.events().find(event => event.fact_id === inferred.id));
+  assert.equal(change.data.kind, "inference");
+  assert.equal(change.data.provenance, "tool_backed");
+  assert.equal(change.data.environment_generation, 2);
+  assert.equal(change.data.status, "proposed");
+  assert.deepEqual(change.data.derived_from, [basis.id]);
+  assert.equal(change.data.artifact_refs[0].id, artifact.id);
 });
 
 test("submission event summaries retain only compact receipt fields", (t) => {
@@ -1012,6 +1041,29 @@ test("dispute relations survive reopening the same SQLite board", (t) => {
   assert.equal(reopened.disputed_by.length, 1);
 });
 
+test("review revisions distinguish invalid input from stale state without writing", (t) => {
+  const { board, create } = setup(t, 1);
+  const challenge = create();
+  board.execute("platform", "dispatch");
+  const revision = board.challenge(challenge.id).revision;
+  const cursor = board.getMeta("event_cursor");
+  const submit = args => board.execute("worker-1", "submit_review", {
+    request_id: randomUUID(), challenge_id: challenge.id, flag: "flag{fixture}", summary: "Fixture candidate", ...args,
+  }, board.context("worker-1"));
+  for (const args of [{}, { expected_revision: String(revision) }, { expected_revision: 0 }, { expected_revision: 1.5 }]) {
+    assert.throws(() => submit(args), error => error.code === "invalid_argument"
+      && error.message.includes("expected_revision") && error.details.revision === revision);
+  }
+  for (const expected_revision of [revision - 1, revision + 1]) {
+    assert.throws(() => submit({ expected_revision }), error => error.code === "revision_conflict"
+      && error.details.revision === revision);
+  }
+  assert.equal(board.challenge(challenge.id).phase, "solving");
+  assert.equal(board.challenge(challenge.id).candidates.length, 0);
+  assert.deepEqual(board.events(cursor), []);
+  assert.equal(submit({ expected_revision: revision }).candidate.flag, "flag{fixture}");
+});
+
 test("parallel review candidates survive; rejection atomically records feedback", (t) => {
   const { board, create, call, lead } = setup(t, 3);
   const challenge = create({ difficulty: "hard" }); board.execute("platform", "dispatch");
@@ -1444,6 +1496,52 @@ test("invalid argument shapes fail with domain codes before writing", (t) => {
   fails(() => fact(call, "worker-1", challenge.id, { evidence: [null] }), "invalid_evidence");
   fails(() => board.execute("platform", "register_artifact", { challenge_id: challenge.id, worker_id: "worker-1" }), "stale_context");
   fails(() => board.execute("worker-1", "post_fact", null), "invalid_argument");
+});
+
+test("closed environments only retain explicitly confirmed local readiness", (t) => {
+  const { board, create } = setup(t, 1);
+  const challenge = create({ ready: false, requires_online_environment: true });
+  for (const args of [{}, { ready: false }]) {
+    board.execute("platform", "set_environment", { challenge_id: challenge.id, status: "closed", ready: true });
+    assert.equal(board.available().new_challenges[0].id, challenge.id);
+    board.execute("platform", "set_environment", { challenge_id: challenge.id, status: "closed", ...args });
+    assert.equal(board.challenge(challenge.id).ready, false);
+    assert.deepEqual(board.available().new_challenges, []);
+    assert.deepEqual(board.execute("platform", "dispatch").assignments, []);
+  }
+});
+
+test("prepared local work keeps its assignment when the first remote instance becomes active", (t) => {
+  const { board, create, call } = setup(t, 1);
+  const challenge = create({ ready: false, requires_online_environment: true });
+  board.execute("platform", "set_environment", { challenge_id: challenge.id, status: "closed", ready: true });
+  assert.equal(board.execute("platform", "dispatch").assignments.length, 1);
+  const context = board.context("worker-1");
+  assert.equal(context.environment_generation, 1);
+  assert.equal(board.challenge(challenge.id).environment.status, "closed");
+  fact(call, "worker-1", challenge.id);
+  board.execute("platform", "set_environment", { challenge_id: challenge.id, status: "active", ready: true, online: true });
+  assert.deepEqual(board.context("worker-1"), context);
+  assert.equal(board.challenge(challenge.id).generation, 1);
+  fails(() => board.execute("platform", "set_environment", {
+    challenge_id: challenge.id, status: "closed", ready: true, new_generation: true,
+  }), "team_not_released");
+  assert.equal(board.challenge(challenge.id).environment.status, "active");
+  assert.deepEqual(board.context("worker-1"), context);
+});
+
+test("explicit local readiness cannot make completed or deferred work claimable", (t) => {
+  const { board, create, lead } = setup(t, 1);
+  const deferred = create({ ready: false });
+  lead("defer", { challenge_id: deferred.id, expected_revision: deferred.revision, reason: "Missing required fixture" });
+  const completed = create({ ready: false });
+  board.execute("platform", "reconcile_completed", { challenge_id: completed.id });
+  for (const [challenge, phase] of [[deferred, "deferred"], [completed, "completed"]]) {
+    board.execute("platform", "set_environment", { challenge_id: challenge.id, status: "closed", ready: true });
+    assert.equal(board.challenge(challenge.id).phase, phase);
+  }
+  assert.deepEqual(board.available(), { new_challenges: [], assistance: [] });
+  assert.deepEqual(board.execute("platform", "dispatch").assignments, []);
 });
 
 test("resume waits for environment confirmation even when the old environment stayed open", (t) => {

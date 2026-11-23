@@ -4,16 +4,18 @@
 
 ## 运行组成
 
-Node.js 主进程承载本地 SQLite 黑板、调度器、Lead、20 个初始 Pi Worker 会话、赛事 HTTP 适配器和本地命令工具。Lead 拥有 `grow_workers` 权限和主动增员义务：结合 cgroup 资源、未认领任务、assembling/援助需求、空闲 Worker 与活跃执行判断容量。待援助且无空闲 Worker、任务可能积压，或资源仍有安全余量且存在有效并行工作时，应及时增员；增员沿用同级成员池。
+Node.js 主进程承载本地 SQLite 黑板、调度器、Lead、20 个初始 Pi Worker 会话、赛事 HTTP 适配器和本地命令工具。Lead 完全不参与解题；通过系统提示词约束职责，保留 `bash`、`read`、`write`、`edit`、`snapshot_file` 和 `record_fact` 供题目信息获取、环境与材料准备、运行故障处理。题目技术分析、解题计算、利用脚本和候选复现全部由 Worker 执行。Lead 检查 Worker 已记录的验证结果、证据、任务身份和官方状态，证据不足时要求 Worker 补充，再决定提交。
+
+Lead 拥有 `grow_workers` 权限，结合 cgroup 资源、未认领任务、具体 blocker、ready Intent、空闲 Worker 与活跃执行判断是否增员。资源余量或新增成员数量本身不能证明存在有效并行方向；增员沿用同级成员池。
 
 - 首次工作由平台分配，后续有可领取工作时平台实时通知空闲 Worker 自选。新题优先于援助。
 - 比赛目录中 `container=false` 的离线题优先是 Lead 的调度策略。Lead 使用 `arena_prepare_offline` 尽早创建缺失题、设置更小的 priority（通常为 0 或 1）、启动离线环境、下载全部附件并写 manifest；平台不替 Lead 硬门禁离线/在线启动顺序，也不本地替 Lead 排在线题目。
-- 在线环境同时最多保持 3 个是赛事 API 配额，`pending`、`active`、`unknown` 和 `closing` 均按真实占用状态处理。API 返回配额拒绝时必须保留原始错误并由 Lead 调整；只有题目完成并确认环境关闭，或暂缓时显式关闭环境并收到关闭确认，才视为补位。`arena_start` 不自动下载附件，Lead 必须在环境就绪后通过 `arena_files` 查询并补取 Worker 需要的文件。
+- 在线环境同时最多保持 3 个是赛事 API 配额，`pending`、`active`、`unknown` 和 `closing` 均按真实占用状态处理。API 返回配额拒绝时必须保留原始错误并由 Lead 调整；只有题目完成并确认环境关闭，或暂缓时显式关闭环境并收到关闭确认，才视为补位。`arena_start` 不自动下载附件。Lead 通过 `arena_files` 查询并补取 Worker 需要的文件；已取得当前步骤所需材料时，可以显式准备本地工作，无须等待在线名额。远端验证仍要求实际环境为 `active`。
 - 每题最多 10 名 Worker，每名 Worker 同时最多持有 3 条 Intent。困难题以主责和援助各一人起步，组队阶段主 Worker 立即做低成本侦察和自动化，不等待第二名成员。第二名 Worker 加入前不累计正式解题时间，可并行方向能够继续触发增援。
 - 新未认领任务始终高于援助任务。困难题先分配一名主 Worker 并进入 assembling/需要援助。只有没有新题且存在空闲 Worker 或 Lead 增员后，才加入援助 Worker。available 中统一按 Lead 设置的 priority 从小到大选择，离线优先不由 Board 额外硬编码。
 - 累计解题达到 30 分钟时，无援助的题开启援助，已有援助的题通知主责研判。
 - Fact、Intent、候选和环境代次保存在题目黑板。文件证据通过不可变快照关联任务、作者和执行身份。
-- 任一成员可提交候选，平台用 Pi `steer` 通知同题团队和 Lead。Lead 授权赛事提交，程序按真实回执更新题目。成员在旧执行结束后释放，后续题目复用原 Pi 会话。
+- 任一成员可在完成候选复现并记录证据后提交候选，平台用 Pi `steer` 通知同题团队和 Lead。Lead 检查已有证据并授权赛事提交，程序按真实回执更新题目。成员在旧执行结束后释放，后续题目复用原 Pi 会话。
 - Lead 可以暂缓和恢复题目，并协调赛事环境名额。工具与依赖在镜像构建阶段准备。
 
 完整平台的 Web 管理页面、账号服务和外部数据库属于原平台。独立运行包的运行数据位于配置的本地工作目录。
@@ -86,14 +88,32 @@ docker run --rm --name bbx-ctf-local \
 
 `arena.mode` 支持 `attempt` 和 `connectivity_test`。模式优先从官方帮助首部的 `Rendered for a single attempt.` 或 `Rendered for a connectivity check.` 标识识别，也可由 JSON 显式指定。两者同时存在时必须一致。缺少模式标识的配置沿用 `attempt`。
 
-- `attempt` 对普通在线题和离线题都先调用赛事 `start`。Lead 应尽快准备并推进离线题，但平台不强制本地 gate；在线题启动顺序由 Lead 根据收益、任务和 Worker 状态决定，3 个实例上限以赛事 API 的真实配额和拒绝回执为准。
-- 在线题启动后不会自动准备附件。环境就绪后由 Lead 调用 `arena_files` 查询官方文件清单，并按准确路径下载 Worker 需要的附件。
+- `attempt` 模式在实际启用赛事环境时调用官方 `start`；已有足够材料的在线题可先准备并推进本地工作。Lead 应尽快准备并推进离线题，但平台不强制本地 gate；在线实例启动顺序由 Lead 根据收益、任务和 Worker 状态决定，3 个实例上限以赛事 API 的真实配额和拒绝回执为准。
+- 在线题启动后不会自动准备附件。Lead 调用 `arena_files` 查询官方文件清单，并按准确路径下载或准备 Worker 当前步骤需要的附件；赛事接口是否允许提前下载以实际回执为准。
 - `connectivity_test` 使用不加载工具的单会话探针。程序只拉取唯一 probe 目录，验证题面包含一个 flag，让真实模型开始一次短回合。观察到首个非空模型增量后，程序立即中止该轮、确认模型与工具均已结束，随后从 `description` 提取 flag 并直接提交。探针省去赛事 `start` 和 `close`，accepted 或 rejected 都会立即结束。整个探针流程最多运行 4 分钟，并同时受 attempt 截止时间约束；到期会主动中止模型会话，且不会提交 flag。目录、题面或模型请求不合法时快速失败。
 - 模式判断使用配置和正式 bootstrap 标识，题目名称与题型字段只用于解题和难度判断。
 
 工具镜像中的 `/opt/ctf-tools/worker-tools.md` 提供精简工具与解释器路径，`/opt/ctf-tools/manifest.json` 保存完整清单。最终镜像构建会从现有基础镜像的 manifest 出发，以 `worker-tools.md` 中实际存在的命令补齐 command 路径，校验基础文件、二进制和归档工具，保留原有 verification 元数据，更新最终镜像用途与赛事运行能力并重写 `manifest.sha256`，不依赖重新拉取或重打基础镜像。
 
 Lead 和 Worker 的系统提示词加载同一份当前镜像清单。Worker 优先组合高信息量命令、复用事实和方向、持久化证据，并在无新增信息时停止重复尝试、申请援助或请求 Lead 判断是否暂缓。`board_act` 的系统提示列出每个角色可用动作及完整必填字段，避免模型通过失败重试猜测参数。
+
+## 材料准备与工具合同
+
+`arena_files` 的三种用法如下。`path` 和 `prepare_paths` 不能同时使用。
+
+| 参数 | 行为 |
+| --- | --- |
+| `challenge_id` | 查询官方文件清单 |
+| `challenge_id, path` | 下载一个准确路径，不隐式派工；已校验材料内容变化会撤销过期的就绪状态 |
+| `challenge_id, prepare_paths` | 校验并准备当前步骤所需的非空路径选集，保存本代次 manifest，并允许本地工作被领取 |
+
+选集准备仅核对指定文件；准备记录区分选集与完整清单，manifest 列出实际文件，不声称后续全部材料已齐备。`ready` 表示当前工作可执行，远端服务是否可用仍看 `environment.status`。首次在线启动前的配额拒绝、未知回执和进程恢复不应清除有效的本地准备，也不应改变已有 assignment。曾经实际运行过的实例关闭并重开时仍更新环境代次：旧 assignment 不能继续执行，旧代次 Intent、候选不能直接继续使用；同题 Fact/Artifact 历史仍保留，可通过现有引用与 `retry_of` 路径复用。
+
+`record_fact` 支持 `derived_from`，推论必须引用已有同题 Fact；`tool_backed` 只表明来源，不表示推论已经成立。Artifact 登记与 Fact/Intent 写入是两个顺序执行的事务。`submit_review` 必须传 `expected_revision`：缺少或非法版本返回 `invalid_argument`，不符合当前状态的合法版本仍保留版本冲突检查。同一 review 内允许不早于 `review_base_revision` 的版本提交并发候选；来自更早 review 的候选返回 `stale_review`。工具失败向模型返回脱敏的 `code`、`message`、必要标量 `details` 和已知的 `outcome_unknown`，不把缺参数计为领取竞争，也不自动重试未知副作用。
+
+文本 `read` 按块扫描，保留内容最多 50 KiB，输出最多 2000 行；远处的按行 offset 仍可能读取大量字节，但不再将整份文本载入内存。图片沿用 Pi SDK 处理。`bash` 保留输出落盘和 backpressure；超时或取消后若输出管道未在 250 ms 内关闭，返回 `drain_timeout` 和 `cleanup_unknown`，这不证明所有离组后代已退出。正常成功输出继续完整排空。
+
+紧凑资源视图保留 Node 内存、OOM 计数、进程运行时间和在途模型/工具数量。Lead 的 dashboard、黑板读取和重要通知提供真实时钟与剩余预算。重复调用提醒只陈述观测到的调用情况，不推断结果没有变化。
 
 ## 回执和恢复
 
@@ -115,7 +135,7 @@ flag 的确定接受、确定拒绝和未知结果分别保存。多 flag 题按
 | `work/<agent>/` | 各会话的本地工作目录 |
 | `shared/challenges/<id>/inputs/` | 按赛事文件清单下载的附件 |
 
-正常退出会清理当前模型、工具与子进程并落盘。使用相同 attempt 配置和工作目录可恢复已保存的任务、会话及未决回执。
+正常退出会等待当前模型和工具结束、清理登记的进程组并落盘。使用相同 attempt 配置和工作目录可恢复已保存的任务、会话及未决回执。
 
 ## 验证命令与范围
 
@@ -131,6 +151,8 @@ node benchmark/run.mjs --counts 1,8,16,20,32,64 --output .data/benchmark-result
 容器验收使用 `scripts/validate-runtime.py`，在禁外网、4 CPU、6 GiB 容器里执行入口检查、Node 测试、实际工具检查以及逐级会话和组合负载。
 
 会话基准测量准备及历史记录成本，组合负载测量固定 CPU/文件操作的吞吐与资源竞争。本地假模型流程验证执行合同，真实比赛解题成功率、模型延迟和题型表现仍需单独端到端评估。完整镜像的上传体积和工具可用性以最终导出制品验收报告为准。
+
+本轮基于 R11/R12 轨迹和固定 R13 代码路径的修复范围、方案二审及真实比赛复测要求见 [运行时优化方案](docs/runtime-optimization-plan.md)。
 
 ## 发布前需补齐的赛事合同
 

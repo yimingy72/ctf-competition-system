@@ -1,13 +1,13 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { mkdir, mkdtemp, readFile, rm } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { spawn } from "node:child_process";
 import { createLocalTools } from "../src/local-tools.mjs";
 
 async function tools(t, options = {}) {
-  const scratch = fileURLToPath(new URL("../../../.data/ctf-standalone-core-20261121/tests/", import.meta.url));
+  const scratch = fileURLToPath(new URL("../.data/tests/", import.meta.url));
   await mkdir(scratch, { recursive: true });
   const cwd = await mkdtemp(join(scratch, "tools-"));
   const local = createLocalTools({ cwd, ...options });
@@ -34,13 +34,103 @@ test("timeout and cancellation reap shell descendants", async (t) => {
   const timeout = await tool("bash").execute({ command: "sleep 60 & wait", timeout: 0.05 }, { callId: "timeout" });
   assert.equal(timeout.details.timed_out, true);
   assert.equal(timeout.isError, true);
+  assert.equal(timeout.details.cleanup_unknown, false);
   assert.equal(local.activeProcesses(), 0);
   const controller = new AbortController();
   const work = tool("bash").execute({ command: "sleep 60 & wait" }, { callId: "abort", signal: controller.signal });
   setTimeout(() => controller.abort(), 50);
   const cancelled = await work;
   assert.equal(cancelled.details.aborted, true);
+  assert.equal(cancelled.details.cleanup_unknown, false);
   assert.equal(local.activeProcesses(), 0);
+});
+
+test("text reads bound retained input and preserve line, UTF-8 and SDK path semantics", async (t) => {
+  const { cwd, tool } = await tools(t);
+  await writeFile(join(cwd, "large.txt"), "first\n" + "x".repeat(4 * 1024 * 1024) + "\nlast😀");
+  const first = await tool("read").execute({ path: "@large.txt", offset: 1, limit: 1 }, { callId: "first" });
+  assert.match(first.content[0].text, /^first\n/);
+  assert.equal(first.details.next_offset, 2);
+  assert.ok(first.details.bytes_read <= 64 * 1024);
+  assert.equal(first.details.truncation.totalBytes, null);
+  const oversized = await tool("read").execute({ path: "large.txt", offset: 2 }, { callId: "oversized" });
+  assert.equal(oversized.details.truncation.firstLineExceedsLimit, true);
+  assert.ok(oversized.details.bytes_read <= 2 * 64 * 1024);
+  assert.ok(oversized.content[0].text.length < 200);
+  const last = await tool("read").execute({ path: "large.txt", offset: 3 }, { callId: "last" });
+  assert.equal(last.content[0].text, "last😀");
+  await assert.rejects(tool("read").execute({ path: "large.txt", offset: 4 }, { callId: "past-end" }), /beyond end/);
+  const unicode = "界😀".repeat(2000);
+  await writeFile(join(cwd, "cafe\u0301.txt"), "p".repeat(65000) + "\n" + unicode + "\nend");
+  const ranged = await tool("read").execute({ path: "@café.txt", offset: 2, limit: 1 }, { callId: "unicode" });
+  assert.equal(ranged.content[0].text.split("\n\n[")[0], unicode);
+  await writeFile(join(cwd, "lines.txt"), "line\n".repeat(2100));
+  const lines = await tool("read").execute({ path: "lines.txt" }, { callId: "lines" });
+  assert.equal(lines.details.next_offset, 2001);
+  assert.equal(lines.details.truncation.outputLines, 2000);
+  await writeFile(join(cwd, "empty-line.txt"), "\nnext");
+  const emptyLine = await tool("read").execute({ path: "empty-line.txt", limit: 1 }, { callId: "empty-line" });
+  assert.equal(emptyLine.details.next_offset, 2);
+  assert.equal(emptyLine.details.truncation.outputLines, 1);
+  const boundary = "界".repeat(Math.floor(50 * 1024 / 3));
+  await writeFile(join(cwd, "byte-boundary.txt"), boundary + "\n尾😀");
+  const bounded = await tool("read").execute({ path: "byte-boundary.txt" }, { callId: "byte-boundary" });
+  assert.equal(bounded.content[0].text.split("\n\n[")[0], boundary);
+  assert.equal(bounded.details.truncation.outputBytes, Buffer.byteLength(boundary));
+  assert.equal(bounded.details.next_offset, 2);
+  assert.equal(bounded.content[0].text.includes("\uFFFD"), false);
+});
+
+test("read retains image support and rejects cancelled or invalid reads", async (t) => {
+  const { cwd, tool } = await tools(t);
+  await writeFile(join(cwd, "pixel.gif"), Buffer.from("R0lGODlhAQABAIAAAAAAAP///ywAAAAAAQABAAACAUwAOw==", "base64"));
+  const picture = await tool("read").execute({ path: "pixel.gif" }, { callId: "picture" });
+  assert.ok(picture.content.some(part => part.type === "image"));
+  await assert.rejects(tool("read").execute({ path: "missing" }, { callId: "missing" }), /ENOENT/);
+  await assert.rejects(tool("read").execute({ path: "pixel.gif", offset: 0 }, { callId: "invalid" }), /positive integer/);
+  const controller = new AbortController();
+  const reading = tool("read").execute({ path: "pixel.gif" }, { callId: "cancel-read", signal: controller.signal });
+  controller.abort();
+  await assert.rejects(reading, /abort/i);
+});
+
+test("timeout and abort stop waiting for output held by a different process group", { skip: process.platform !== "linux" }, async (t) => {
+  const { cwd, local, tool } = await tools(t);
+  for (const mode of ["timeout", "signal", "local"]) {
+    const pidFile = join(cwd, `${mode}.pid`);
+    let pid;
+    const controller = new AbortController();
+    const command = `setsid sh -c 'echo $$ > ${mode}.pid; sleep 5' & wait`;
+    const started = performance.now();
+    const work = tool("bash").execute({ command, ...(mode === "timeout" ? { timeout: 0.2 } : {}) },
+      { callId: `escaped-${mode}`, signal: controller.signal });
+    try {
+      const deadline = Date.now() + 2000;
+      while (!pid && Date.now() < deadline) {
+        try { pid = Number(await readFile(pidFile, "utf8")); }
+        catch (error) { if (error.code !== "ENOENT") throw error; }
+        if (!pid) await new Promise(accept => setTimeout(accept, 5));
+      }
+      assert.ok(pid);
+      if (mode === "signal") controller.abort();
+      if (mode === "local") local.abort();
+      const result = await work;
+      assert.equal(result.details.drain_timeout, true);
+      assert.equal(result.details.cleanup_unknown, true);
+      assert.equal(result.details.timed_out, mode === "timeout");
+      assert.equal(result.details.aborted, mode !== "timeout");
+      assert.equal(result.isError, true);
+      assert.equal(local.activeProcesses(), 0);
+      assert.ok(performance.now() - started < 3000);
+    } finally {
+      controller.abort();
+      if (pid) {
+        try { process.kill(-pid, "SIGKILL"); }
+        catch (error) { if (error.code !== "ESRCH") throw error; }
+      }
+      await work.catch(() => {});
+    }
+  }
 });
 
 test("a missing working directory fails promptly and preserves nonzero exit status", async (t) => {

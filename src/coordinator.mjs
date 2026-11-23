@@ -230,6 +230,10 @@ function preparationMarkerKey(challenge) {
   return `offline_prepared:${challenge.id}:${challenge.generation}`;
 }
 
+function activationMarkerKey(challenge) {
+  return `environment_activated:${challenge.id}:${challenge.generation}`;
+}
+
 function normalizedPreparedFiles(files) {
   if (!Array.isArray(files)) return null;
   const normalized = [];
@@ -277,6 +281,7 @@ function challengeSummary(challenge) {
     difficulty: challenge.difficulty,
     priority: challenge.priority,
     phase: challenge.phase,
+    defer_reason: challenge.defer_reason ?? null,
     revision: challenge.revision,
     claim_revision: challenge.claim_revision,
     generation: challenge.generation,
@@ -327,9 +332,24 @@ function compactResources(snapshot) {
       peak_bytes: snapshot.memory.peak_bytes,
       anonymous_bytes: snapshot.memory.anonymous_bytes,
       file_cache_bytes: snapshot.memory.file_cache_bytes,
+      oom_count: snapshot.memory.oom_count ?? null,
+      oom_kill_count: snapshot.memory.oom_kill_count ?? null,
+      node: snapshot.memory.node ? {
+        rss: snapshot.memory.node.rss,
+        heapUsed: snapshot.memory.node.heapUsed,
+        heapTotal: snapshot.memory.node.heapTotal,
+        external: snapshot.memory.node.external,
+      } : null,
     } : null,
     disk: snapshot?.disk ? { available_bytes: snapshot.disk.available_bytes } : null,
     event_loop: snapshot?.event_loop ? { p99_ms: snapshot.event_loop.p99_ms } : null,
+    runtime: snapshot?.runtime ?? null,
+    execution: {
+      model_inflight: (snapshot?.execution?.sessions ?? [])
+        .reduce((total, session) => total + Number(session.model_inflight ?? 0), 0),
+      tool_inflight: (snapshot?.execution?.sessions ?? [])
+        .reduce((total, session) => total + Number(session.tool_inflight ?? 0), 0),
+    },
     workers: {
       total: workers.length,
       idle: idleWorkers.length,
@@ -363,6 +383,9 @@ function factSummary(fact) {
     id: fact.id,
     version: fact.version,
     statement: fact.statement,
+    kind: fact.kind,
+    provenance: fact.provenance,
+    derived_from: fact.derived_from ?? [],
     status: fact.status,
     author: fact.author,
     environment_generation: fact.environment_generation,
@@ -714,6 +737,7 @@ export class ContestRun {
       fact_write_count: 0,
       intent_write_count: 0,
       claim_conflicts: 0,
+      tool_errors: {},
       submission_conflicts: 0,
       notification_replays: 0,
       session_rebuilds: 0,
@@ -1020,7 +1044,7 @@ export class ContestRun {
       + JSON.stringify({ mode: this.config.arena.mode, rules: this.config.arena.helpMarkdown,
         catalog: this.catalog.map(compactCatalogItem), recovery,
         runtime_recovery: runtimeRecovery,
-        board: this.leadDashboard(), expires_at: this.config.arena.expiresAt }),
+        board: this.leadDashboard(), ...this.competitionClock() }),
     { eventId: `startup:${randomUUID()}` });
     for (const worker of this.board.workers()) {
       if (!worker.assignment_id) continue;
@@ -1258,6 +1282,7 @@ export class ContestRun {
   leadDashboard() {
     const snapshot = this.board.snapshot("lead");
     return {
+      ...this.competitionClock(),
       challenges: snapshot.challenges.map((challenge) => challengeSummary(challenge)),
       available: snapshot.available,
       workers: snapshot.workers.map((worker) => ({
@@ -1269,6 +1294,16 @@ export class ContestRun {
         error: worker.error,
       })),
       event_cursor: snapshot.event_cursor,
+    };
+  }
+
+  competitionClock(now = Date.now()) {
+    const expiresAt = this.config.arena.expiresAt;
+    return {
+      now: new Date(now).toISOString(),
+      expires_at: Number.isFinite(expiresAt) ? new Date(expiresAt).toISOString() : null,
+      remaining_seconds: Number.isFinite(expiresAt)
+        ? Math.max(0, Math.floor((expiresAt - now) / 1000)) : null,
     };
   }
 
@@ -1303,6 +1338,7 @@ export class ContestRun {
               ready: false,
               requires_online_environment: catalogRequiresEnvironment(item),
             });
+            this.board.setMeta(activationMarkerKey(challenge), false);
             report.recovered.push(item.unique_code);
           } catch (error) {
             report.pending.push({ unique_code: item.unique_code, error: failure(error) });
@@ -1398,18 +1434,22 @@ export class ContestRun {
     if (event.type === "tool_end") {
       if (event.isError) this.metrics.tool_failures += 1;
       this.rememberHardBootstrapTool(id, event);
-      const signature = event.args_digest ?? event.tool;
+      const signature = typeof event.args_digest === "string"
+        ? JSON.stringify([event.tool, event.context?.assignment_id ?? null,
+          event.context?.environment_generation ?? null, event.args_digest]) : null;
       const previous = this.toolSignatures.get(id);
-      const count = previous?.signature === signature ? previous.count + 1 : 1;
-      this.toolSignatures.set(id, { signature, count });
+      const repeated = signature !== null && previous?.signature === signature;
+      const count = repeated ? previous.count + 1 : 1;
+      const allFailed = Boolean(event.isError) && (!repeated || previous.allFailed);
+      this.toolSignatures.set(id, { signature, count, allFailed });
       if (count === 3 && event.context?.challenge_id) {
         try {
           this.board.execute("platform", "progress_stalled", {
             challenge_id: event.context.challenge_id,
             worker_id: id,
-            reason: event.isError
+            reason: allFailed
               ? "The same tool invocation failed repeatedly"
-              : "The same tool invocation repeated without a new result",
+              : "The same tool invocation repeated; inspect its results before deciding whether to continue",
             signature,
             attempts: count,
           });
@@ -1766,7 +1806,7 @@ export class ContestRun {
           .some(section => section.type === "online_environment_released"));
         this.queueNotification("lead", "黑板有新批次需要处理。只读取下面列出的题目和增量，不要重读无关环境。"
           + (releasedOnline ? "本批次包含在线环境名额已释放事件，立即补位或按策略调整。" : "")
-          + JSON.stringify({ updates: leadUpdates }),
+          + JSON.stringify({ clock: this.competitionClock(), updates: leadUpdates }),
         { eventId: `lead-batch:${event.id}`, version: 0, scope: "global" });
       }
       if (events.length) this.board.setMeta("coordinator_cursor", events.at(-1).id);
@@ -1840,6 +1880,7 @@ export class ContestRun {
           + "请结合未认领新题、实际空闲 Worker 和一次真实资源采样，决定是否调用 grow_workers。"
           + JSON.stringify({
             event: "challenges_need_assistance",
+            clock: this.competitionClock(),
             challenge_count: assistanceNeeds.length,
             challenges: assistanceNeeds,
             unclaimed_new_challenges: dispatch.available.new_challenges.map(
@@ -1905,6 +1946,7 @@ export class ContestRun {
             + "结合未认领任务和活跃执行决定等待、调整 priority 或调用 grow_workers。"
             + JSON.stringify({
               event: "new_task_backlog_without_assignable_worker",
+              clock: this.competitionClock(),
               unclaimed_new_challenge_count: backlogItems.length,
               unclaimed_new_challenges: backlogItems,
               resources,
@@ -1950,7 +1992,8 @@ export class ContestRun {
         && this.pool.status().find(item => item.id === "lead")?.idle) {
         const key = JSON.stringify(unfinished.map(challenge => [challenge.id, challenge.revision]));
         if (this.board.getMeta("deferred_notice") !== key) {
-          this.queueNotification("lead", "当前未完成题目均已暂缓。结合资源和剩余时间恢复题目，或明确决定结束比赛。" + JSON.stringify(unfinished),
+          this.queueNotification("lead", "当前未完成题目均已暂缓。结合资源和剩余时间恢复题目，或明确决定结束比赛。"
+            + JSON.stringify({ clock: this.competitionClock(), challenges: unfinished.map(challengeSummary) }),
             { eventId: `deferred:${randomUUID()}` });
           this.board.setMeta("deferred_notice", key);
           await this.flushNotifications();
@@ -2041,8 +2084,10 @@ export class ContestRun {
       invalidated_at: Date.now(),
     });
     const current = this.board.challenge(challenge.id);
-    if (current.ready && current.environment.status === "active") {
-      this.setEnvironment({ challenge_id: current.id, status: "active", ready: false });
+    if (current.ready && current.generation === challenge.generation) {
+      this.board.execute("platform", "set_environment", {
+        challenge_id: current.id, status: current.environment.status, ready: false,
+      });
     }
   }
 
@@ -2103,18 +2148,86 @@ export class ContestRun {
     }
   }
 
-  async prepareChallengeInputs(challenge, { markReady = true, refresh = false } = {}) {
+  environmentWasActive(challenge) {
+    const key = activationMarkerKey(challenge);
+    if (challenge.environment.status === "active") {
+      this.board.setMeta(key, true);
+      return true;
+    }
+    const saved = this.board.getMeta(key);
+    if (typeof saved === "boolean") return saved;
+    // Fresh tasks have no start attempt. For older persisted closed/unknown states,
+    // preserve the conservative restart behavior instead of accepting old results.
+    const active = challenge.environment.status !== "pending"
+      || this.board.getMeta(`environment_start:${challenge.id}`) !== null;
+    this.board.setMeta(key, active);
+    return active;
+  }
+
+  assertPreparationContext(challenge) {
+    const current = this.board.challenge(challenge.id);
+    if (current.generation !== challenge.generation
+      || !["pending", "assembling", "solving", "reviewing"].includes(current.phase)) {
+      throw Object.assign(new Error("The task changed while preparing inputs"), { code: "stale_context" });
+    }
+    return current;
+  }
+
+  async localAnalysisReady(challenge) {
+    const marker = this.board.getMeta(preparationMarkerKey(challenge));
+    if (!marker?.local_analysis
+      || !["pending", "assembling", "solving", "reviewing"].includes(challenge.phase)
+      || this.board.getMeta(`environment_generation:${challenge.id}`, challenge.generation) > challenge.generation
+      || challenge.environment.status === "closed" && this.environmentWasActive(challenge)) return false;
+    const validation = await this.validatePreparedInputs(challenge);
+    if (validation.valid) return true;
+    await this.invalidatePreparedInputs(challenge, validation.reason);
+    return false;
+  }
+
+  async prepareChallengeInputs(challenge, { markReady = true, refresh = false, paths } = {}) {
     let current = this.board.challenge(challenge.id);
-    if (current.environment.status !== "active") {
+    const origin = { id: current.id, generation: current.generation };
+    const selected = paths !== undefined;
+    if (selected && (!Array.isArray(paths) || paths.length === 0
+      || paths.some(path => typeof path !== "string" || !path.trim())
+      || new Set(paths).size !== paths.length)) {
+      throw Object.assign(new Error("prepare_paths must contain distinct nonblank listed paths"), {
+        code: "invalid_argument",
+      });
+    }
+    this.assertPreparationContext(origin);
+    if (!selected && current.environment.status !== "active") {
       throw Object.assign(new Error("Inputs can only be prepared in an active environment"), {
         code: "environment_not_active",
         details: { challenge_id: current.id, status: current.environment.status },
       });
     }
-    const existing = refresh ? { valid: false } : await this.validatePreparedInputs(current);
-    if (existing.valid) {
+    if (selected && (current.environment.status === "closed" && this.environmentWasActive(current)
+      || this.board.getMeta(`environment_generation:${current.id}`, current.generation) > current.generation)) {
+      throw Object.assign(new Error("Reopen the previous environment before preparing its new generation"), {
+        code: "environment_restart_required",
+      });
+    }
+    this.environmentWasActive(current);
+    const saved = this.board.getMeta(preparationMarkerKey(current));
+    const sameSelection = !selected || Array.isArray(saved?.files)
+      && saved.files.length === paths.length
+      && paths.every(path => saved.files.some(file => file.source_path === path));
+    const existing = refresh || !sameSelection ? { valid: false } : await this.validatePreparedInputs(current);
+    const reusable = existing.valid && (selected
+      ? paths.every(path => existing.files.some(file => file.source_path === path))
+      : existing.marker.scope !== "selected");
+    if (reusable) {
+      current = this.assertPreparationContext(origin);
+      if (selected && !existing.marker.local_analysis) {
+        existing.marker = { ...existing.marker, local_analysis: true };
+        this.board.setMeta(preparationMarkerKey(current), existing.marker);
+      }
       if (markReady && !current.ready) {
-        this.setEnvironment({ challenge_id: current.id, status: "active", ready: true });
+        this.board.execute("platform", "set_environment", {
+          challenge_id: current.id, status: current.environment.status, ready: true,
+        });
         current = this.board.challenge(current.id);
       }
       return {
@@ -2124,6 +2237,7 @@ export class ContestRun {
         files: existing.files.map(file => ({ ...file, cached: true })),
         materials: {
           status: "ready",
+          scope: existing.marker.scope ?? "listed",
           listed: existing.files.length,
           downloaded: existing.files.length,
           missing: [],
@@ -2136,34 +2250,42 @@ export class ContestRun {
         cached: true,
       };
     }
-    if (current.ready) {
-      this.setEnvironment({ challenge_id: current.id, status: "active", ready: false });
-      current = this.board.challenge(current.id);
-    }
     const listed = this.config.arena.mode === "connectivity_test"
       ? []
       : await this.arena.listFiles(current.unique_code, { signal: this.stopController.signal });
+    current = this.assertPreparationContext(origin);
+    const listedPaths = listed.map(entry => typeof entry === "string" ? entry : entry.path);
+    if (selected && paths.some(path => !listedPaths.includes(path))) {
+      throw Object.assign(new Error("Prepare only exact paths from the official file list"), {
+        code: "material_not_listed", details: { missing: paths.filter(path => !listedPaths.includes(path)) },
+      });
+    }
+    if (current.ready && (!selected || !existing.valid)) {
+      this.board.execute("platform", "set_environment", {
+        challenge_id: current.id, status: current.environment.status, ready: false,
+      });
+      current = this.board.challenge(current.id);
+    }
     const files = [];
-    for (const entry of [...listed].sort((left, right) => {
-      const leftPath = typeof left === "string" ? left : left.path;
-      const rightPath = typeof right === "string" ? right : right.path;
-      return leftPath.localeCompare(rightPath);
-    })) {
-      const path = typeof entry === "string" ? entry : entry.path;
+    for (const path of [...(selected ? paths : listedPaths)].sort()) {
       files.push(await this.saveListedFile(current, path));
     }
+    current = this.assertPreparationContext(origin);
     const written = await this.writePreparationManifest(current, files);
     const marker = {
       version: PREPARED_INPUT_VERSION,
       challenge_id: current.id,
       unique_code: current.unique_code,
       generation: current.generation,
+      scope: selected ? "selected" : "listed",
+      local_analysis: selected,
       manifest_path: written.manifestPath,
       manifest_size: written.manifestSize,
       manifest_sha256: written.manifestSha256,
       files: normalizedPreparedFiles(files),
       prepared_at: Date.now(),
     };
+    current = this.assertPreparationContext(origin);
     await this.recordPreparationFact(current, written.manifestPath, written.manifestSha256, marker.files);
     this.board.setMeta(preparationMarkerKey(current), marker);
     const validation = await this.validatePreparedInputs(current);
@@ -2174,7 +2296,10 @@ export class ContestRun {
         details: validation,
       });
     }
-    if (markReady) this.setEnvironment({ challenge_id: current.id, status: "active", ready: true });
+    current = this.assertPreparationContext(origin);
+    if (markReady) this.board.execute("platform", "set_environment", {
+      challenge_id: current.id, status: current.environment.status, ready: true,
+    });
     current = this.board.challenge(current.id);
     return {
       challenge: current,
@@ -2183,6 +2308,7 @@ export class ContestRun {
       files,
       materials: {
         status: "ready",
+        scope: marker.scope,
         listed: files.length,
         downloaded: files.length,
         missing: [],
@@ -2325,17 +2451,20 @@ export class ContestRun {
       const catalog = this.catalog.find(item => item.unique_code === challenge.unique_code);
       const online = catalogRequiresEnvironment(catalog, challenge.requires_online_environment !== false);
       if (challenge.environment.status === "active") {
+        this.board.setMeta(activationMarkerKey(challenge), true);
         if (challenge.ready !== dispatchReady) {
           this.setEnvironment({ challenge_id: id, status: "active", ready: dispatchReady });
           challenge = this.board.challenge(id);
         }
         return { challenge, receipt: challenge.environment.connection };
       }
-      if (challenge.environment.status === "closed") {
+      const wasActive = this.environmentWasActive(challenge);
+      if (challenge.environment.status === "closed" && wasActive) {
         this.board.setMeta(`environment_generation:${id}`, challenge.generation + 1);
       }
+      const localReady = await this.localAnalysisReady(challenge);
       this.board.setMeta(`environment_start:${id}`, { time: Date.now() });
-      this.board.execute("platform", "set_environment", { challenge_id: id, ready: false, status: "pending", online });
+      this.board.execute("platform", "set_environment", { challenge_id: id, ready: localReady, status: "pending", online });
       let receipt;
       let state;
       try {
@@ -2381,7 +2510,7 @@ export class ContestRun {
             detail: error.detail ?? null,
             outcome_unknown: error.outcomeUnknown ?? false,
           };
-          this.board.execute("platform", "set_environment", { challenge_id: id, ready: false,
+          this.board.execute("platform", "set_environment", { challenge_id: id, ready: localReady,
             status: error.outcomeUnknown ? "unknown" : "closed", online, connection });
           this.queueEnvironmentStartRejection(challenge, error, online);
           throw error;
@@ -2393,7 +2522,7 @@ export class ContestRun {
         if (state === "active") receipt = current;
       }
       this.setEnvironment({
-        challenge_id: id, ready: state === "active" && dispatchReady, status: state,
+        challenge_id: id, ready: localReady || state === "active" && dispatchReady, status: state,
         online: catalogRequiresEnvironment(receipt, online), connection: receipt,
       });
       challenge = this.board.challenge(id);
@@ -2404,8 +2533,10 @@ export class ContestRun {
   setEnvironment(args) {
     const challenge = this.board.challenge(args.challenge_id);
     const target = this.board.getMeta(`environment_generation:${challenge.id}`, challenge.generation);
-    return this.board.execute("platform", "set_environment", { ...args,
+    const updated = this.board.execute("platform", "set_environment", { ...args,
       new_generation: args.status === "active" && target > challenge.generation });
+    if (args.status === "active") this.board.setMeta(activationMarkerKey(updated), true);
+    return updated;
   }
 
   async reconcileEnvironments() {
@@ -2413,31 +2544,36 @@ export class ContestRun {
     const results = [];
     for (const challenge of this.challenges()) {
       if (!["pending", "active", "unknown", "closing", "closed"].includes(challenge.environment.status)) continue;
-      if (challenge.environment.status === "pending" && !this.board.getMeta(`environment_start:${challenge.id}`)) continue;
+      this.environmentWasActive(challenge);
+      if (challenge.environment.status === "pending" && !this.board.getMeta(`environment_start:${challenge.id}`)
+        && !this.board.getMeta(preparationMarkerKey(challenge))?.local_analysis) continue;
       const actual = catalog.find(item => item.unique_code === challenge.unique_code);
       const status = environmentState(actual);
       const online = catalogRequiresEnvironment(actual, challenge.requires_online_environment !== false);
       if (status === "unknown") {
-        if (challenge.ready || challenge.environment.status !== "unknown") {
+        const localReady = await this.localAnalysisReady(challenge);
+        if (challenge.ready !== localReady || challenge.environment.status !== "unknown") {
           this.setEnvironment({
             challenge_id: challenge.id,
             status: "unknown",
-            ready: false,
+            ready: localReady,
             online,
             connection: actual,
           });
         }
-        results.push({ challenge_id: challenge.id, status, ready: false });
+        results.push({ challenge_id: challenge.id, status, ready: localReady });
         continue;
       }
-      if (status === "closed" && !["completed", "deferred"].includes(challenge.phase)) {
+      if (status === "closed" && !["completed", "deferred"].includes(challenge.phase)
+        && this.environmentWasActive(challenge)) {
         const handled = await this.handleExternallyClosedEnvironment(challenge, actual, online);
         results.push({ challenge_id: challenge.id, status,
           deferred: this.board.challenge(challenge.id).phase === "deferred",
           released: handled?.released ?? this.board.challenge(challenge.id).members.length === 0 });
         continue;
       }
-      const ready = status === "active" && !["completed", "deferred"].includes(challenge.phase);
+      const ready = !["completed", "deferred"].includes(challenge.phase)
+        && (status === "active" || await this.localAnalysisReady(challenge));
       const changed = challenge.environment.status !== status
         || challenge.environment.online !== online
         || challenge.ready !== ready
@@ -2445,13 +2581,20 @@ export class ContestRun {
       if (changed) {
         this.setEnvironment({ challenge_id: challenge.id, status, ready, online, connection: actual });
       }
+      if (status === "active") this.board.setMeta(activationMarkerKey(this.board.challenge(challenge.id)), true);
       results.push({ challenge_id: challenge.id, status, ready });
     }
     return results;
   }
 
-  async files(id, path) {
+  async files(id, path, preparePaths) {
     const challenge = this.board.challenge(id);
+    if (path !== undefined && preparePaths !== undefined) {
+      throw Object.assign(new Error("Use path or prepare_paths, not both"), { code: "invalid_argument" });
+    }
+    if (preparePaths !== undefined) {
+      return this.controlOperation(() => this.prepareChallengeInputs(challenge, { paths: preparePaths }));
+    }
     if (this.config.arena.mode === "connectivity_test") {
       return { files: [], description: this.catalog.find(item => item.unique_code === challenge.unique_code)?.description ?? challenge.description };
     }
@@ -2480,7 +2623,9 @@ export class ContestRun {
           sha256: downloaded.sha256, cached: true, changed: false };
       }
       await rename(temporary, destination);
-      if (this.board.getMeta(preparationMarkerKey(challenge))) {
+      const prepared = this.board.getMeta(preparationMarkerKey(challenge));
+      if (prepared && (prepared.scope !== "selected"
+        || prepared.files?.some(file => file.source_path === path))) {
         await this.invalidatePreparedInputs(challenge, "attachment_content_changed");
       }
       return { path: destination, source_path: path, size: downloaded.size,
@@ -2525,6 +2670,7 @@ export class ContestRun {
             ready: false,
             requires_online_environment: false,
           });
+          this.board.setMeta(activationMarkerKey(challenge), false);
         }
         if (challenge.phase === "deferred" || challenge.phase === "completed") {
           const validation = await this.validatePreparedInputs(challenge);
@@ -2748,7 +2894,12 @@ export class ContestRun {
       execute: async (args, execution) => {
         try { return await execute(args, execution); }
         catch (error) {
-          if (["work_changed", "revision_conflict"].includes(error.code)) this.metrics.claim_conflicts += 1;
+          const action = name === "board_act" ? `${name}.${args.action}` : name;
+          const key = `${action}:${error.code ?? "operation_failed"}`;
+          this.metrics.tool_errors[key] = (this.metrics.tool_errors[key] ?? 0) + 1;
+          if (name === "board_act" && args.action === "claim" && error.code === "work_changed") {
+            this.metrics.claim_conflicts += 1;
+          }
           if (["stale_review", "stale_candidate", "submission_unresolved"].includes(error.code)) {
             this.metrics.submission_conflicts += 1;
           }
@@ -2768,8 +2919,11 @@ export class ContestRun {
           entity_id: Type.Optional(text),
           limit: Type.Optional(Type.Integer({ minimum: 1, maximum: 1000 })),
         }),
-        args => this.board.snapshot(id, { challengeId: args.challenge_id, sinceRevision: args.since_cursor,
-          view: args.view, entityKind: args.entity_kind, entityId: args.entity_id, limit: args.limit })),
+        args => {
+          const snapshot = this.board.snapshot(id, { challengeId: args.challenge_id, sinceRevision: args.since_cursor,
+            view: args.view, entityKind: args.entity_kind, entityId: args.entity_id, limit: args.limit });
+          return role === "lead" ? { ...snapshot, ...this.competitionClock() } : snapshot;
+        }),
       tool("board_act", "Update the blackboard. request_id is automatic. Priority is 0 highest through 3 lowest. "
         + "claim: challenge_id,expected_claim_revision. "
         + "create_challenge: unique_code,title,description,difficulty(easy|medium|hard),multi_stage,priority. "
@@ -2780,14 +2934,14 @@ export class ContestRun {
         + "next_intents entries support optional disputes:[intent_id]. "
         + "post_intent: challenge_id,statement,based_on:[fact_id],expected,method, "
         + "optional claim/parallel/parallel_key/depends_on/retry_of/disputes:[intent_id]. "
-        + "claim_intent: challenge_id,expected_revision,intent_id,expected_version. "
-        + "release_intent: challenge_id,expected_revision,intent_id,note. "
+        + "claim_intent: challenge_id,intent_id,expected_version. "
+        + "release_intent: challenge_id,intent_id,note. "
         + "request_assistance: challenge_id,expected_revision,reason,additional_workers plus intent_ids and/or "
         + "blocker_fact_id. Posting a ready parallel Intent already opens assistance capacity, so a following "
         + "request_assistance for the same direction is an idempotent confirmation. Use blocker_fact_id for a "
         + "concrete blocker. "
         + "request_deferral: challenge_id,expected_revision,reason. "
-        + "submit_review: challenge_id,flag,summary,fact_refs. "
+        + "submit_review: challenge_id,expected_revision,flag,summary; optional fact_refs. "
         + "reject_review: challenge_id,expected_revision,review_revision,reason. "
         + "Read the returned revision before another task write.",
         Type.Object({ action: Type.Union((role === "lead" ? LEAD_ACTIONS : WORKER_ACTIONS).map(action => Type.Literal(action))), args: Type.Record(Type.String(), Type.Unknown()) }),
@@ -2800,7 +2954,11 @@ export class ContestRun {
             input.description ??= catalog.description;
             input.requires_online_environment = catalogRequiresEnvironment(catalog);
           }
-          return this.board.execute(id, args.action, input, execution.context);
+          const result = this.board.execute(id, args.action, input, execution.context);
+          if (args.action === "create_challenge" && this.board.getMeta(activationMarkerKey(result)) === null) {
+            this.board.setMeta(activationMarkerKey(result), false);
+          }
+          return result;
         }),
       tool("snapshot_file", "Capture a file as immutable evidence, then reference its artifact_id in a Fact. This records an observed file snapshot.",
         Type.Object({ path: text, challenge_id: text }), async (args, execution) => {
@@ -2816,13 +2974,14 @@ export class ContestRun {
           assertOrigin();
           return this.board.execute("platform", "register_artifact", { ...artifact, challenge_id: args.challenge_id, worker_id: id, context: execution.context });
         }),
-      tool("record_fact", "Record a short Fact from the latest completed bash output. The platform snapshots that output as an immutable Artifact, then creates the Fact and optional next_intents in one transaction. Each next Intent may carry disputes:[intent_id].",
+      tool("record_fact", "Record a short Fact from the latest completed bash output. The platform registers an immutable Artifact first, then creates the Fact and optional next_intents in a separate Board transaction. Inferences require derived_from Fact ids. Each next Intent may carry disputes:[intent_id].",
         Type.Object({
           challenge_id: text,
           statement: text,
           kind: Type.Optional(Type.Union(["observation", "inference", "structure"]
             .map(value => Type.Literal(value)))),
           summary: Type.Optional(text),
+          derived_from: Type.Optional(Type.Array(text)),
           next_intents: Type.Optional(Type.Array(Type.Object({
             statement: text,
             expected: text,
@@ -2861,6 +3020,7 @@ export class ContestRun {
             challenge_id: args.challenge_id,
             statement: args.statement,
             kind: args.kind,
+            derived_from: args.derived_from,
             evidence: [{ artifact_id: registered.id,
               summary: args.summary ?? `Captured output from ${latest.tool}` }],
             next_intents: args.next_intents,
@@ -2878,7 +3038,10 @@ export class ContestRun {
         Type.Object({}), () => this.prepareOffline()),
       tool("arena_start", "Start one created task through the official API. The coordinator does not enforce local offline prerequisites, online instance counts, or quota policy. API errors such as environment_limit or quota failures are preserved for Lead. Pending environments need a later retry.",
         challengeParameter, args => this.startChallenge(args.challenge_id)),
-      tool("arena_files", "List official statement and attachment paths, or download one exact listed path to shared inputs.", Type.Object({ challenge_id: text, path: Type.Optional(text) }), args => this.files(args.challenge_id, args.path)),
+      tool("arena_files", "List official paths, download one exact path, or explicitly prepare_paths for a local analysis step before an online instance is available. path is download-only and cannot be combined with prepare_paths. Preparation validates only the selected files, records their generation-bound manifest, and makes local work claimable; it does not assert that all future materials or a remote service are ready.",
+        Type.Object({ challenge_id: text, path: Type.Optional(text),
+          prepare_paths: Type.Optional(Type.Array(text, { minItems: 1, uniqueItems: true })) }),
+        args => this.files(args.challenge_id, args.path, args.prepare_paths)),
       tool("submit_flag", "Authorize a candidate and submit its flag. Accepted, rejected, and unknown results are persisted. Reconcile unknown outcomes first. If official progress remains unchanged, retrying the exact same candidate is safe and is rejected by the server as duplicate when the first request was accepted.",
         Type.Object({ challenge_id: text, candidate_id: text, review_revision: Type.Integer() }), (args, execution) => this.submit(args, execution.callId)),
       tool("reconcile_submissions", "Read official progress to reconcile unknown submissions without submitting again.", Type.Object({}), () => this.reconcilePendingSubmissions()),
